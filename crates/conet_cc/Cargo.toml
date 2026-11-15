@@ -1,0 +1,18 @@
+[package]
+name = "conet_cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Format-agnostic Conet congestion-control hook"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+conet_core = { path = "../conet_core" }
+
+[dev-dependencies]
+conet_udp = { path = "../conet_udp" }

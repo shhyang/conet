@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/conet_core",
+    "crates/conet_cc",
+    "crates/conet_fountain",
+    "crates/conet_udp",
+    "crates/conet_transfer",
+    "crates/conet_mux",
+    "crates/conet_sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["Shenghao Yang <shenghao.yang@gmail.com>"]
+repository = "https://github.com/shhyang/conet"
+homepage = "https://github.com/shhyang/conet"
+readme = "README.md"
+keywords = ["networking", "udp", "fountain", "congestion-control"]
+categories = ["network-programming"]
+
+[workspace.dependencies]
+conet_core = { path = "crates/conet_core", version = "0.1.0" }
+conet_cc = { path = "crates/conet_cc", version = "0.1.0" }
+conet_fountain = { path = "crates/conet_fountain", version = "0.1.0" }
+conet_udp = { path = "crates/conet_udp", version = "0.1.0" }
+conet_transfer = { path = "crates/conet_transfer", version = "0.1.0" }
+conet_mux = { path = "crates/conet_mux", version = "0.1.0" }
+conet_sim = { path = "crates/conet_sim", version = "0.1.0" }

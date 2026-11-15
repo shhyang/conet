@@ -1,0 +1,18 @@
+[package]
+name = "conet_fountain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Raptor-10 fountain-code adapter for the Conet reliability BlockCodec boundary"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fountain_engine = "2.1.0"
+fountain_scheme = "2.1.0"
+fountain_utility = "2.1.0"
+conet_core = { path = "../conet_core" }

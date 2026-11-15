@@ -1,0 +1,21 @@
+[package]
+name = "conet_transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Reference one-way-first file transfer app for Conet UDP-LI and the deterministic simulator"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "conet_transfer"
+path = "src/main.rs"
+
+[dependencies]
+conet_core = { path = "../conet_core" }
+conet_fountain = { path = "../conet_fountain" }
+conet_udp = { path = "../conet_udp" }
