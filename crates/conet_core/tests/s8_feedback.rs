@@ -1,5 +1,5 @@
 use conet_core::{
-    paced_identity_link, BackingAccounting, BidirectionalAck, BlockId,
+    device_stub_link, paced_identity_link, BackingAccounting, BidirectionalAck, BlockId,
     BlockStatus, FeedbackKind, FeedbackResponderConfig, InProcessLink, LinkEndpoint, LinkReceiver,
     MonoNs, PacketHandle, PacketMetrics, PacketQueue, PayloadCopyCounter, QueueLimits,
     ReliabilityResponder, ReliabilitySender, SystematicBlockCodec,
@@ -359,3 +359,40 @@ fn t18_nack_before_ack_keeps_sending_and_reordered_stale_nack_is_ignored() {
     assert_eq!(no_nested.acks_generated, 0);
 }
 
+#[test]
+fn g6_policy_swap_keeps_same_core_and_distinct_stop_semantics() {
+    let copies = PayloadCopyCounter::new();
+    let mut one_way_codec = SystematicBlockCodec::new(4, copies.clone()).unwrap();
+    one_way_codec
+        .add_block(BLOCK, b"policy-swap-object".to_vec())
+        .unwrap();
+    let mut one_way = ReliabilitySender::new(
+        one_way_codec,
+        conet_core::OneWayBudget::new(3),
+        limits(8),
+        metrics(&copies),
+    );
+    one_way.register_block(BLOCK, MonoNs::ZERO).unwrap();
+    let (mut link, _receiver) = device_stub_link(limits(8), 1_000_000);
+    for step in 0..4 {
+        one_way.pump(&mut link, ms(step * 10), 1, 1);
+        let _ = conet_core::Drive::drive(&mut link, ms(step * 10));
+    }
+    assert_eq!(one_way.status(BLOCK), Some(BlockStatus::StoppedByBudget));
+
+    let mut harness = Harness::new();
+    let (mut bidirectional, _copies, _) = make_sender(BidirectionalAck::new(12, ms(2_000)), 8);
+    let mut responder = make_responder(success_config());
+    let (recovery_at, mut feedback) = send_until_recovered(
+        &mut harness,
+        &mut bidirectional,
+        &mut responder,
+        MonoNs::ZERO,
+    );
+    harness.inject_feedback(feedback.pop().unwrap());
+    let ack = bidirectional.pump_bidirectional(&mut harness.a, recovery_at, 0, 0);
+    assert_eq!(ack.acked, 1);
+    assert!(ack.cancelled > 0);
+    bidirectional.stage(recovery_at.saturating_add(ms(2_000)), 8);
+    assert_eq!(bidirectional.status(BLOCK), Some(BlockStatus::Delivered));
+}

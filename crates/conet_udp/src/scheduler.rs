@@ -6,7 +6,6 @@ use conet_core::{ByteRate, MonoNs};
 /// never interpreted by the link scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendClass {
-    Association,
     LinkControl,
     Feedback,
     FileData,
@@ -115,7 +114,6 @@ impl ControlWindow {
 /// supplies readiness and piggyback preference; this helper encodes the fixed
 /// priority order.
 pub fn choose_class(
-    association_waiting: bool,
     link_control_waiting: bool,
     feedback_waiting: bool,
     file_data_waiting: bool,
@@ -125,9 +123,7 @@ pub fn choose_class(
     if file_data_waiting && consecutive_non_file >= max_consecutive_non_file {
         return Some(SendClass::FileData);
     }
-    if association_waiting {
-        Some(SendClass::Association)
-    } else if link_control_waiting {
+    if link_control_waiting {
         Some(SendClass::LinkControl)
     } else if feedback_waiting {
         Some(SendClass::Feedback)
@@ -168,11 +164,11 @@ mod tests {
     #[test]
     fn anti_starvation_releases_file_data_after_two_non_file_sends() {
         assert_eq!(
-            choose_class(false, true, true, true, 0, 2),
+            choose_class(true, true, true, 0, 2),
             Some(SendClass::LinkControl)
         );
         assert_eq!(
-            choose_class(false, false, true, true, 2, 2),
+            choose_class(false, true, true, 2, 2),
             Some(SendClass::FileData)
         );
     }

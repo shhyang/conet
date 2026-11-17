@@ -3,14 +3,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conet_core::{
-    BlockId, ControlDisposition, ControlMessage, ControlType, Feedback, MonoNs, OpaqueBytes, Pace,
-    QosClass, QueueLimits, ReferenceWireCodec, TxController, WireFlags, WireHeader,
-    decode_reliability_feedback, encode_reliability_feedback,
+    BlockCodec, BlockId, BlockShape, ControlDisposition, ControlMessage, ControlType, Feedback,
+    MonoNs, OpaqueBytes, Pace, QosClass, QueueLimits, ReferenceWireCodec, SymbolId, SymbolMeta,
+    SystematicBlockCodec, TxController, WireFlags, WireHeader, decode_reliability_data,
+    decode_reliability_feedback, encode_reliability_data, encode_reliability_feedback,
 };
 use conet_udp::{
-    AssociationState, DatagramTransport, EndpointConfig, InboundDatagram, OpenStateBody,
-    ProfileEnqueueErrorKind, Role, SendClass, SimNetwork, SimTransport, UDP_LI_PROFILE_ID,
-    UdpLiEndpoint, payload_packet,
+    AssociationState, DatagramTransport, EndpointConfig, InboundDatagram, LocalSendOutcome,
+    ProfileEnqueueErrorKind, Role, SendClass, SimNetwork, SimTransport, UdpLiEndpoint,
+    payload_packet,
 };
 
 type SimEndpoint = UdpLiEndpoint<SimTransport>;
@@ -27,42 +28,11 @@ fn endpoint(network: &SimNetwork, host: usize, role: Role, rate: u64) -> SimEndp
     UdpLiEndpoint::new(network.transport(host), EndpointConfig::new(role, rate))
 }
 
-fn established_pair(rate: u64) -> (SimNetwork, SimEndpoint, SimEndpoint) {
+fn ready_pair(rate: u64) -> (SimNetwork, SimEndpoint, SimEndpoint) {
     let network = SimNetwork::new();
-    let mut a = endpoint(&network, 0, Role::Initiator, rate);
-    let mut b = endpoint(&network, 1, Role::Responder, rate);
-    a.establish_for_test(0x1122_3344, 1).unwrap();
-    b.establish_for_test(0x1122_3344, 1).unwrap();
-    (network, a, b)
-}
-
-fn handshake_pair(rate: u64) -> (SimNetwork, SimEndpoint, SimEndpoint) {
-    let network = SimNetwork::new();
-    network.set_authenticated(true);
-    let mut a = endpoint(&network, 0, Role::Initiator, rate);
+    let a = endpoint(&network, 0, Role::Initiator, rate);
     let b = endpoint(&network, 1, Role::Responder, rate);
-    a.start_association().unwrap();
     (network, a, b)
-}
-
-fn pump_handshake(network: &SimNetwork, a: &mut SimEndpoint, b: &mut SimEndpoint, now: MonoNs) {
-    for step in 0..8 {
-        let drive_at = now.saturating_add(ms(step + 1));
-        a.drive(drive_at);
-        b.drive(drive_at);
-        if a.state() == AssociationState::Established
-            && b.state() == AssociationState::Established
-            && network.pending(0) == 0
-            && network.pending(1) == 0
-        {
-            return;
-        }
-    }
-    panic!(
-        "association did not establish: A={:?}, B={:?}",
-        a.state(),
-        b.state()
-    );
 }
 
 fn header(epoch: u16, link_seq: u32, qos: QosClass) -> WireHeader {
@@ -214,210 +184,125 @@ fn recording_endpoint(
 }
 
 #[test]
-fn association_open_accept_close_and_fresh_id() {
-    let (network, mut a, mut b) = handshake_pair(u64::MAX);
-    let first_id = a.association_id().unwrap();
-    assert_eq!(a.epoch(), 1);
-    pump_handshake(&network, &mut a, &mut b, MonoNs::ZERO);
-
-    a.close().unwrap();
-    for step in 0..6 {
-        a.drive(ms(step + 1));
-        b.drive(ms(step + 1));
-    }
-    assert_eq!(a.state(), AssociationState::Closed);
-    assert_eq!(b.state(), AssociationState::Closed);
-    let codec = ReferenceWireCodec::default();
-    let controls: Vec<_> = network
-        .frames_from(0)
-        .into_iter()
-        .filter_map(|frame| {
-            codec
-                .parse(OpaqueBytes::from(frame.bytes))
-                .ok()
-                .and_then(|datagram| datagram.control().cloned())
-        })
-        .collect();
-    let open_seq = controls
-        .iter()
-        .find(|control| control.ctrl_type == ControlType::Open)
-        .unwrap()
-        .ctrl_seq;
-    let close_seq = controls
-        .iter()
-        .find(|control| control.ctrl_type == ControlType::Close)
-        .unwrap()
-        .ctrl_seq;
-    assert_ne!(close_seq, open_seq);
-
-    a.start_association().unwrap();
-    assert_ne!(a.association_id().unwrap(), first_id);
-    assert_eq!(a.epoch(), 1);
-}
-
-#[test]
-fn responder_handshakes_until_accept_is_sent() {
+fn no_handshake_data_and_feedback_flow_immediately() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let mut a = endpoint(&network, 0, Role::Initiator, u64::MAX);
     let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    a.start_association().unwrap();
-
-    a.drive(ms(1));
-    b.drive(ms(1));
-    assert_eq!(b.state(), AssociationState::Handshaking);
-    assert_eq!(b.queued(SendClass::Association), 1);
-
-    b.drive(ms(2));
-    assert_eq!(b.state(), AssociationState::Established);
-    a.drive(ms(2));
-    assert_eq!(a.state(), AssociationState::Established);
-}
-
-#[test]
-fn unauthenticated_association_controls_fail_closed_unless_overridden() {
-    let network = SimNetwork::new();
-    let mut a = endpoint(&network, 0, Role::Initiator, u64::MAX);
-    let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    a.start_association().unwrap();
-    a.drive(ms(1));
-    b.drive(ms(1));
-    assert_eq!(b.state(), AssociationState::Idle);
-    assert_eq!(b.drop_count("unauthenticated_association"), 1);
-
-    let override_network = SimNetwork::new();
-    let mut override_a = UdpLiEndpoint::new(
-        override_network.transport(0),
-        EndpointConfig::new(Role::Initiator, u64::MAX).test_open(),
-    );
-    let mut override_b = UdpLiEndpoint::new(
-        override_network.transport(1),
-        EndpointConfig::new(Role::Responder, u64::MAX).test_open(),
-    );
-    override_a.start_association().unwrap();
-    pump_handshake(
-        &override_network,
-        &mut override_a,
-        &mut override_b,
-        MonoNs::ZERO,
-    );
-    override_a.close().unwrap();
-    for step in 0..4 {
-        let now = ms(10 + step);
-        override_a.drive(now);
-        override_b.drive(now);
-    }
-    assert_eq!(override_a.state(), AssociationState::Closed);
-    assert_eq!(override_b.state(), AssociationState::Closed);
-}
-
-#[test]
-fn authenticated_open_has_no_header_send_timestamp() {
-    let network = SimNetwork::new();
-    network.set_authenticated(true);
-    let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    let open = OpenStateBody {
-        profile_id: UDP_LI_PROFILE_ID,
-        max_datagram: 1280,
-        nonce: 0x5151,
-    }
-    .encode();
-    network.inject(
-        1,
-        wire_frame(
-            1,
-            0,
-            QosClass::Control,
-            OpaqueBytes::new(),
-            Some(ControlMessage::new(ControlType::Open, 1, open)),
-        ),
-        true,
-    );
-
-    b.drive(MonoNs::ZERO);
-    assert_eq!(b.state(), AssociationState::Handshaking);
-    assert_eq!(b.drop_count("unfresh_control"), 0);
-}
-
-#[test]
-fn live_zero_time_handshake_establishes_without_retry() {
-    let network = SimNetwork::new();
-    network.set_authenticated(true);
-    let mut a = endpoint(&network, 0, Role::Initiator, u64::MAX);
-    let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    a.start_association().unwrap();
-
-    a.drive(MonoNs::ZERO);
-    b.drive(MonoNs::ZERO);
-    b.drive(MonoNs::ZERO);
-    a.drive(MonoNs::ZERO);
-
-    assert_eq!(a.state(), AssociationState::Established);
-    assert_eq!(b.state(), AssociationState::Established);
-    let codec = ReferenceWireCodec::default();
-    let opens: Vec<_> = network
-        .frames_from(0)
-        .into_iter()
-        .filter_map(|frame| codec.parse(OpaqueBytes::from(frame.bytes)).ok())
-        .filter_map(|datagram| datagram.control().cloned())
-        .filter(|control| control.ctrl_type == ControlType::Open)
-        .collect();
-    assert_eq!(opens.len(), 1);
-    let parsed = codec
-        .parse(OpaqueBytes::from(network.frames_from(0).remove(0).bytes))
+    assert_eq!(a.state(), AssociationState::Ready);
+    assert_eq!(b.state(), AssociationState::Ready);
+    a.enqueue_file_data(payload_packet(b"manifest-or-fountain-symbol"))
         .unwrap();
-    assert_eq!(parsed.packet().header().len(), 12);
-    assert_eq!(parsed.packet().header().as_bytes()[2], 5);
-}
+    a.enqueue_feedback_value(Feedback::ack(BlockId::new(7)))
+        .unwrap();
 
-#[test]
-fn authenticated_association_rejects_unauthenticated_close() {
-    let (network, mut a, mut b) = handshake_pair(u64::MAX);
-    pump_handshake(&network, &mut a, &mut b, MonoNs::ZERO);
-    network.set_authenticated(false);
+    let first = a.drive(ms(1));
+    assert_eq!(first.sent, 1);
+    assert_eq!(a.drive(ms(2)).sent, 1);
+    b.drive(ms(2));
+    let received = b.take_received();
+    assert_eq!(received.len(), 2);
+    assert!(received.iter().all(|datagram| {
+        datagram.header.epoch == 1
+            && datagram.packet.header().len() == 12
+            && datagram.packet.header().as_bytes()[2] == 5
+    }));
+    assert!(
+        received
+            .iter()
+            .any(|datagram| datagram.packet.payload_bytes() == b"manifest-or-fountain-symbol")
+    );
 
-    a.close().unwrap();
-    a.drive(ms(10));
-    b.drive(ms(10));
-    assert_eq!(a.state(), AssociationState::Closing);
-    assert_eq!(b.state(), AssociationState::Established);
-    assert_eq!(b.drop_count("unauthenticated_association"), 1);
-}
-
-#[test]
-fn duplicated_open_is_bounded_to_five_sends_then_fails() {
-    let network = SimNetwork::new();
-    let mut a = endpoint(&network, 0, Role::Initiator, u64::MAX);
-    a.start_association().unwrap();
-
-    for step in 0..5 {
-        a.drive(ms(step * 200));
-    }
-    let frames = network.frames_from(0);
-    assert_eq!(frames.len(), 5);
+    b.enqueue_feedback_value(Feedback::ack(BlockId::new(7)))
+        .unwrap();
+    b.drive(ms(3));
+    a.drive(ms(3));
+    assert_eq!(
+        a.take_received()[0].packet.payload_bytes(),
+        encode_reliability_feedback(Feedback::ack(BlockId::new(7)))
+    );
     let codec = ReferenceWireCodec::default();
-    let mut ctrl_seqs = Vec::new();
-    for frame in &frames {
+    for frame in network.frames() {
         let parsed = codec
             .parse(OpaqueBytes::copy_from_slice(&frame.bytes))
             .unwrap();
-        let control = parsed.control().unwrap();
-        assert_eq!(control.ctrl_type, ControlType::Open);
-        ctrl_seqs.push(control.ctrl_seq);
+        assert!(parsed.control().is_none());
     }
-    assert!(ctrl_seqs.windows(2).all(|pair| pair[0] == pair[1]));
+}
 
-    let report = a.drive(ms(1_000));
-    assert!(report.association_failed);
-    assert_eq!(a.state(), AssociationState::Failed);
-    assert_eq!(network.frames_from(0).len(), 5);
+#[test]
+fn legacy_open_and_accept_are_inert_controls() {
+    let network = SimNetwork::new();
+    let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
+    for (link_seq, ctrl_type) in [(0, ControlType::Open), (1, ControlType::Accept)] {
+        network.inject(
+            1,
+            wire_frame(
+                1,
+                link_seq,
+                QosClass::Control,
+                OpaqueBytes::new(),
+                Some(ControlMessage::new(
+                    ctrl_type,
+                    link_seq,
+                    OpaqueBytes::from_static(b"legacy-setup"),
+                )),
+            ),
+            true,
+        );
+    }
+    b.drive(MonoNs::ZERO);
+    assert_eq!(b.state(), AssociationState::Ready);
+    assert_eq!(network.frames_from(1).len(), 0);
+}
+
+#[test]
+fn local_reset_and_close_send_no_setup_packets() {
+    let (network, mut a, _b) = ready_pair(u64::MAX);
+    let first_id = a.association_id().unwrap();
+    a.start_association().unwrap();
+    assert_ne!(a.association_id().unwrap(), first_id);
+    assert_eq!(a.state(), AssociationState::Ready);
+    assert!(network.frames_from(0).is_empty());
+
+    a.close().unwrap();
+    assert_eq!(a.state(), AssociationState::Closed);
+    assert!(network.frames_from(0).is_empty());
+}
+
+#[test]
+fn ul1_closed_refuses_enqueue_and_does_not_transmit() {
+    let (network, mut a, _b) = ready_pair(u64::MAX);
+    a.close().unwrap();
+    assert_eq!(a.state(), AssociationState::Closed);
+
+    let file_err = a
+        .enqueue_file_data(payload_packet(OpaqueBytes::from_static(b"x")))
+        .expect_err("closed file enqueue");
+    assert_eq!(file_err.kind(), ProfileEnqueueErrorKind::Closed);
+
+    let control_err = a
+        .enqueue_link_control(OpaqueBytes::from_static(b"cc"))
+        .expect_err("closed control enqueue");
+    assert_eq!(control_err.kind(), ProfileEnqueueErrorKind::Closed);
+
+    let report = a.drive(MonoNs::ZERO);
+    assert_eq!(report.sent, 0);
+    assert!(network.frames_from(0).is_empty());
+
+    // Initiator may reopen locally without a peer handshake.
+    a.start_association().unwrap();
+    assert_eq!(a.state(), AssociationState::Ready);
+    a.enqueue_file_data(payload_packet(OpaqueBytes::from_static(b"y")))
+        .unwrap();
+    let report = a.drive(MonoNs::ZERO);
+    assert_eq!(report.sent, 1);
 }
 
 #[test]
 fn authenticated_cc_applies_without_send_timestamp_or_delay() {
     let network = SimNetwork::new();
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(2_000));
-    b.establish_for_test(0x3030, 1).unwrap();
     network.inject(
         1,
         wire_frame(
@@ -448,7 +333,6 @@ fn cc_replay_is_left_to_the_private_codec_while_payload_remains_independent() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(2_000));
-    b.establish_for_test(0x3030, 1).unwrap();
 
     let piggybacked = wire_frame(
         1,
@@ -507,7 +391,6 @@ fn cc_without_private_identity_is_not_rejected_by_the_link_window() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(2_000));
-    b.establish_for_test(0x3033, 1).unwrap();
 
     for (link_seq, ctrl_seq, body) in [
         (1, 100, b"first-control".as_slice()),
@@ -583,7 +466,6 @@ fn attached_cc_replay_is_still_passed_to_the_private_codec() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    b.establish_for_test(0x3032, 1).unwrap();
     let frame = wire_frame(
         1,
         1,
@@ -614,16 +496,10 @@ fn attached_cc_replay_is_still_passed_to_the_private_codec() {
 }
 
 #[test]
-fn open_retries_with_reused_ctrl_seq_stay_first_copy_wins() {
+fn legacy_open_does_not_send_accept_or_change_the_datapath() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
-    let open = OpenStateBody {
-        profile_id: UDP_LI_PROFILE_ID,
-        max_datagram: 1280,
-        nonce: 0x5252,
-    }
-    .encode();
 
     network.inject(
         1,
@@ -631,34 +507,22 @@ fn open_retries_with_reused_ctrl_seq_stay_first_copy_wins() {
             1,
             0,
             QosClass::Control,
-            OpaqueBytes::new(),
-            Some(ControlMessage::new(ControlType::Open, 77, open.clone())),
+            OpaqueBytes::from_static(b"normal-data"),
+            Some(ControlMessage::new(
+                ControlType::Open,
+                77,
+                OpaqueBytes::from_static(b"legacy-setup"),
+            )),
         ),
         true,
     );
     b.drive(MonoNs::ZERO);
-    assert_eq!(b.state(), AssociationState::Handshaking);
-    assert_eq!(b.queued(SendClass::Association), 1);
-
-    network.inject(
-        1,
-        wire_frame(
-            1,
-            1,
-            QosClass::Control,
-            OpaqueBytes::new(),
-            Some(ControlMessage::new(ControlType::Open, 77, open)),
-        ),
-        true,
-    );
-    b.drive(MonoNs::ZERO);
-    assert_eq!(b.state(), AssociationState::Established);
-    assert_eq!(b.queued(SendClass::Association), 0);
-    assert_eq!(b.drop_count("replayed_control"), 1);
-    assert_eq!(network.frames_from(1).len(), 1);
-
-    b.drive(ms(1));
-    assert_eq!(network.frames_from(1).len(), 1);
+    assert_eq!(b.state(), AssociationState::Ready);
+    assert_eq!(network.frames_from(1).len(), 0);
+    let received = b.take_received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].packet.payload_bytes(), b"normal-data");
+    assert!(received[0].control.is_none());
 }
 
 #[test]
@@ -666,7 +530,6 @@ fn control_delay_alone_does_not_cause_a_drop() {
     let network = SimNetwork::new();
     network.set_authenticated(true);
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(3_000));
-    b.establish_for_test(0x3031, 1).unwrap();
     network.inject(
         1,
         wire_frame(
@@ -695,7 +558,7 @@ fn control_delay_alone_does_not_cause_a_drop() {
 
 #[test]
 fn t2_profile_mixed_classes_debit_full_udp_payload_lengths() {
-    let (_network, mut a, _b) = established_pair(1_000);
+    let (_network, mut a, _b) = ready_pair(1_000);
     a.enqueue_file_data(payload_packet([0x11; 80])).unwrap();
     a.enqueue_feedback_value(Feedback::ack(BlockId::new(7)))
         .unwrap();
@@ -726,7 +589,6 @@ fn t3_file_queue_backpressure_returns_handle_and_respects_bounds() {
     let mut config = EndpointConfig::new(Role::Initiator, u64::MAX);
     config.file_data_limits = QueueLimits::new(2, 200, 200).with_max_packet_bytes(100);
     let mut a = UdpLiEndpoint::new(network.transport(0), config);
-    a.establish_for_test(9, 1).unwrap();
 
     a.enqueue_file_data(payload_packet([1; 80])).unwrap();
     a.enqueue_file_data(payload_packet([2; 80])).unwrap();
@@ -746,7 +608,7 @@ fn t3_file_queue_backpressure_returns_handle_and_respects_bounds() {
 
 #[test]
 fn t4_transmit_fields_use_exclusive_header_and_shared_payload_is_immutable() {
-    let (network, mut a, _b) = established_pair(u64::MAX);
+    let (network, mut a, _b) = ready_pair(u64::MAX);
     let payload = payload_packet(b"shared-fanout-payload");
     let sibling = payload.fanout();
     let backing = payload.backing_id();
@@ -766,15 +628,16 @@ fn t4_transmit_fields_use_exclusive_header_and_shared_payload_is_immutable() {
 }
 
 #[test]
-fn t12_m12_failed_send_rolls_back_and_retry_has_one_completion() {
+fn t12_m12_would_block_keeps_item_unsent_then_one_completion() {
     let network = SimNetwork::new();
     let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, u64::MAX, None);
-    a.establish_for_test(17, 1).unwrap();
     a.enqueue_file_data(payload_packet([0xab; 48])).unwrap();
     network.fail_next_send(0);
 
     let failed = a.drive(ms(10));
+    assert!(failed.send_would_block);
     assert!(failed.send_failed);
+    assert_eq!(failed.send_outcome, Some(LocalSendOutcome::WouldBlock));
     assert_eq!(failed.sent, 0);
     assert_eq!(a.next_link_seq(), 0);
     assert_eq!(a.queued(SendClass::FileData), 1);
@@ -787,6 +650,7 @@ fn t12_m12_failed_send_rolls_back_and_retry_has_one_completion() {
 
     let retried = a.drive(ms(20));
     assert_eq!(retried.sent, 1);
+    assert_eq!(retried.send_outcome, Some(LocalSendOutcome::Accepted));
     assert_eq!(a.next_link_seq(), 1);
     let sent = evidence.lock().unwrap().sent.clone();
     assert_eq!(sent.len(), 1);
@@ -801,8 +665,154 @@ fn t12_m12_failed_send_rolls_back_and_retry_has_one_completion() {
 }
 
 #[test]
+fn transient_send_errors_drop_only_the_unaccepted_front_item() {
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::HostUnreachable,
+        std::io::ErrorKind::NetworkUnreachable,
+    ] {
+        let network = SimNetwork::new();
+        let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, 1_000, None);
+        a.enqueue_file_data(payload_packet([0x11; 48])).unwrap();
+        a.enqueue_file_data(payload_packet([0x22; 48])).unwrap();
+        network.fail_next_send_with(0, kind);
+        let ready_before = a.ready_at();
+
+        let failed = a.drive(ms(10));
+        assert_eq!(
+            failed.send_outcome,
+            Some(LocalSendOutcome::TransientDrop),
+            "{kind:?}"
+        );
+        assert!(failed.send_failed, "{kind:?}");
+        assert!(!failed.send_would_block, "{kind:?}");
+        assert_eq!(failed.sent, 0, "{kind:?}");
+        assert_eq!(a.state(), AssociationState::Ready, "{kind:?}");
+        assert_eq!(a.next_link_seq(), 0, "{kind:?}");
+        assert_eq!(a.queued(SendClass::FileData), 1, "{kind:?}");
+        assert_eq!(a.ready_at(), ready_before, "{kind:?}");
+        assert!(a.sent().is_empty(), "{kind:?}");
+        assert!(evidence.lock().unwrap().sent.is_empty(), "{kind:?}");
+        assert!(network.frames_from(0).is_empty(), "{kind:?}");
+        assert_eq!(a.drop_count("sendto_transient"), 1, "{kind:?}");
+
+        let accepted = a.drive(ms(20));
+        assert_eq!(
+            accepted.send_outcome,
+            Some(LocalSendOutcome::Accepted),
+            "{kind:?}"
+        );
+        assert_eq!(accepted.sent, 1, "{kind:?}");
+        assert_eq!(a.queued(SendClass::FileData), 0, "{kind:?}");
+        assert_eq!(a.next_link_seq(), 1, "{kind:?}");
+        assert!(a.ready_at() > ready_before, "{kind:?}");
+        assert_eq!(a.sent()[0].link_seq, 0, "{kind:?}");
+        let accounted = evidence.lock().unwrap().sent.clone();
+        assert_eq!(accounted.len(), 1, "{kind:?}");
+        assert_eq!(accounted[0].2, Some(0), "{kind:?}");
+
+        let frames = network.frames_from(0);
+        assert_eq!(frames.len(), 1, "{kind:?}");
+        let parsed = ReferenceWireCodec::default()
+            .parse(OpaqueBytes::copy_from_slice(&frames[0].bytes))
+            .unwrap();
+        assert_eq!(parsed.packet().payload_bytes(), [0x22; 48], "{kind:?}");
+        assert_eq!(parsed.header().link_seq, 0, "{kind:?}");
+    }
+}
+
+#[test]
+fn interrupted_send_stays_queued_and_retries_without_counting() {
+    let network = SimNetwork::new();
+    let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, 1_000, None);
+    a.enqueue_file_data(payload_packet([0x33; 48])).unwrap();
+    network.fail_next_send_with(0, std::io::ErrorKind::Interrupted);
+
+    let interrupted = a.drive(ms(10));
+    assert_eq!(
+        interrupted.send_outcome,
+        Some(LocalSendOutcome::Interrupted)
+    );
+    assert!(interrupted.send_failed);
+    assert!(!interrupted.send_would_block);
+    assert_eq!(interrupted.sent, 0);
+    assert_eq!(a.state(), AssociationState::Ready);
+    assert_eq!(a.queued(SendClass::FileData), 1);
+    assert_eq!(a.next_link_seq(), 0);
+    assert!(a.sent().is_empty());
+    assert!(evidence.lock().unwrap().sent.is_empty());
+    assert!(network.frames_from(0).is_empty());
+    assert_eq!(
+        &a.queued_front_header(SendClass::FileData).unwrap()[4..8],
+        &[0; 4]
+    );
+
+    let accepted = a.drive(ms(20));
+    assert_eq!(accepted.send_outcome, Some(LocalSendOutcome::Accepted));
+    assert_eq!(accepted.sent, 1);
+    assert_eq!(a.queued(SendClass::FileData), 0);
+    assert_eq!(a.next_link_seq(), 1);
+    assert_eq!(a.sent()[0].link_seq, 0);
+    let accounted = evidence.lock().unwrap().sent.clone();
+    assert_eq!(accounted.len(), 1);
+    assert_eq!(accounted[0].2, Some(0));
+}
+
+#[test]
+fn hard_send_errors_are_explicitly_fatal_and_remain_queued() {
+    let network = SimNetwork::new();
+    let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, 1_000, None);
+    a.enqueue_file_data(payload_packet([0x44; 48])).unwrap();
+    network.fail_next_send_with(0, std::io::ErrorKind::InvalidInput);
+
+    let fatal = a.drive(ms(10));
+    assert_eq!(fatal.send_outcome, Some(LocalSendOutcome::Fatal));
+    assert!(fatal.send_failed);
+    assert!(!fatal.send_would_block);
+    assert_eq!(fatal.sent, 0);
+    assert_eq!(a.state(), AssociationState::Ready);
+    assert_eq!(a.queued(SendClass::FileData), 1);
+    assert_eq!(a.next_link_seq(), 0);
+    assert!(a.sent().is_empty());
+    assert!(evidence.lock().unwrap().sent.is_empty());
+    assert_eq!(a.drop_count("sendto_failed"), 1);
+}
+
+#[test]
+fn successful_network_loss_counts_as_sent_but_would_block_does_not() {
+    let network = SimNetwork::new();
+    let mut a = endpoint(&network, 0, Role::Initiator, u64::MAX);
+    let mut b = endpoint(&network, 1, Role::Responder, u64::MAX);
+
+    network.drop_next(0);
+    a.enqueue_file_data(payload_packet(b"written-then-lost"))
+        .unwrap();
+    let lost = a.drive(MonoNs::ZERO);
+    assert_eq!(lost.sent, 1);
+    assert_eq!(lost.send_outcome, Some(LocalSendOutcome::Accepted));
+    assert_eq!(a.queued(SendClass::FileData), 0);
+    assert_eq!(a.next_link_seq(), 1);
+    assert!(network.frames_from(0)[0].dropped);
+    b.drive(MonoNs::ZERO);
+    assert!(b.take_received().is_empty());
+
+    a.enqueue_file_data(payload_packet(b"local-backpressure"))
+        .unwrap();
+    network.fail_next_send(0);
+    let blocked = a.drive(ms(1));
+    assert_eq!(blocked.sent, 0);
+    assert!(blocked.send_would_block);
+    assert!(blocked.send_failed);
+    assert_eq!(blocked.send_outcome, Some(LocalSendOutcome::WouldBlock));
+    assert_eq!(a.queued(SendClass::FileData), 1);
+    assert_eq!(a.next_link_seq(), 1);
+    assert_eq!(a.sent().len(), 1);
+}
+
+#[test]
 fn t8_t9_stale_and_future_epochs_do_not_change_state_or_rate() {
-    let (network, _a, mut b) = established_pair(2_000);
+    let (network, _a, mut b) = ready_pair(2_000);
     b.restart().unwrap();
     assert_eq!(b.epoch(), 2);
     let state = b.state();
@@ -833,7 +843,6 @@ fn t8_t9_stale_and_future_epochs_do_not_change_state_or_rate() {
 fn t13_t14_profile_validation_drops_without_rate_or_association_change() {
     let network = SimNetwork::new();
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(9_000));
-    b.establish_for_test(0x4455_6677, 1).unwrap();
     let original_state = b.state();
     let original_rate = b.target_rate();
     let original_observations = b.observations().len();
@@ -883,7 +892,6 @@ fn t13_t14_profile_validation_drops_without_rate_or_association_change() {
 fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
     let network = SimNetwork::new();
     let (mut b, evidence) = recording_endpoint(&network, 1, Role::Responder, 1_000, Some(4_000));
-    b.establish_for_test(21, 1).unwrap();
     assert!(!b.config().allow_unauthenticated_cc);
 
     let control = Some(ControlMessage::new(
@@ -905,7 +913,7 @@ fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
     assert_eq!(denied.dropped, 0);
     assert_eq!(b.observations().len(), 1);
     assert!(evidence.lock().unwrap().peer_bodies.is_empty());
-    assert_eq!(b.state(), AssociationState::Established);
+    assert_eq!(b.state(), AssociationState::Ready);
     let delivered = b.take_received();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].packet.payload_bytes(), b"coded");
@@ -915,7 +923,7 @@ fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
     b.drive(ms(1));
     assert_eq!(b.target_rate(), 4_000);
     assert_eq!(evidence.lock().unwrap().peer_bodies.len(), 1);
-    assert_eq!(b.state(), AssociationState::Established);
+    assert_eq!(b.state(), AssociationState::Ready);
 
     let open_network = SimNetwork::new();
     let open_evidence = Arc::new(Mutex::new(ControllerEvidence::default()));
@@ -930,7 +938,6 @@ fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
         Box::new(open_controller),
         None,
     );
-    test_open.establish_for_test(22, 1).unwrap();
     open_network.inject(
         1,
         wire_frame(
@@ -950,7 +957,6 @@ fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
     let stale_network = SimNetwork::new();
     let (mut stale, stale_evidence) =
         recording_endpoint(&stale_network, 1, Role::Responder, 1_000, Some(7_000));
-    stale.establish_for_test(23, 1).unwrap();
     stale_network.inject(
         1,
         wire_frame(
@@ -977,8 +983,68 @@ fn t15_unauthenticated_cc_is_fail_closed_even_for_test_open() {
 }
 
 #[test]
+fn t10_simulated_loss_and_reorder_recover_from_thinned_sets() {
+    let (network, mut a, mut b) = ready_pair(u64::MAX);
+    network.set_loss_pattern(0, [true, false, false, false, false]);
+    network.set_latency_pattern(
+        0,
+        [
+            MonoNs::ZERO,
+            ms(30),
+            MonoNs::ZERO,
+            MonoNs::ZERO,
+            MonoNs::ZERO,
+        ],
+    );
+    let block = BlockId::new(42);
+    let object = b"abcdefghijklmnop".to_vec();
+    let shape = BlockShape::new(4, 4, object.len()).unwrap();
+    let mut decoder = SystematicBlockCodec::new(4, conet_core::PayloadCopyCounter::new()).unwrap();
+
+    for symbol in 0..5_u64 {
+        let start = (symbol as usize % 4) * 4;
+        let body = encode_reliability_data(block, SymbolId::new(symbol), &object[start..start + 4]);
+        a.enqueue_file_data(payload_packet(body)).unwrap();
+    }
+
+    let mut recovered = false;
+    for step in 1..=5 {
+        let now = ms(step * 10);
+        a.drive(now);
+        b.drive(now);
+        for received in b.take_received() {
+            let content = decode_reliability_data(OpaqueBytes::copy_from_slice(
+                received.packet.payload_bytes(),
+            ))
+            .unwrap();
+            let status = decoder
+                .accumulate(
+                    SymbolMeta {
+                        block_id: content.block_id,
+                        symbol_id: content.rel_seq,
+                        shape,
+                    },
+                    &content.coded_vector,
+                )
+                .unwrap();
+            recovered |= matches!(status, conet_core::DecodeStatus::BlockRecovered);
+        }
+    }
+
+    assert!(recovered);
+    assert_eq!(decoder.take_recovered_block(block).unwrap(), object);
+    let seqs: Vec<_> = b
+        .observations()
+        .iter()
+        .map(|observation| observation.seq.unwrap())
+        .collect();
+    assert!(!seqs.contains(&0), "first link sequence was lost");
+    assert_ne!(seqs, vec![1, 2, 3, 4], "simulator reordered arrivals");
+}
+
+#[test]
 fn t11_two_non_file_sends_maximum_when_file_data_waits() {
-    let (_network, mut a, _b) = established_pair(u64::MAX);
+    let (_network, mut a, _b) = ready_pair(u64::MAX);
     for block in 1..=3 {
         a.enqueue_feedback_value(Feedback::ack(BlockId::new(block)))
             .unwrap();
@@ -1002,7 +1068,7 @@ fn t11_two_non_file_sends_maximum_when_file_data_waits() {
 
 #[test]
 fn control_piggybacks_on_an_existing_reverse_path_datagram() {
-    let (network, mut a, _b) = established_pair(u64::MAX);
+    let (network, mut a, _b) = ready_pair(u64::MAX);
     a.enqueue_file_data(payload_packet(b"reverse-path-data"))
         .unwrap();
     a.enqueue_link_control(OpaqueBytes::from_static(b"cc-body"))
@@ -1027,7 +1093,7 @@ fn control_piggybacks_on_an_existing_reverse_path_datagram() {
 
 #[test]
 fn feedback_piggyback_keeps_feedback_qos_when_control_rides_along() {
-    let (network, mut a, _b) = established_pair(u64::MAX);
+    let (network, mut a, _b) = ready_pair(u64::MAX);
     a.enqueue_feedback_value(Feedback::ack(BlockId::new(8)))
         .unwrap();
     a.enqueue_link_control(OpaqueBytes::from_static(b"cc"))
@@ -1056,7 +1122,7 @@ fn feedback_piggyback_keeps_feedback_qos_when_control_rides_along() {
 
 #[test]
 fn receive_demux_uses_payload_len_instead_of_qos_class() {
-    let (network, _a, mut b) = established_pair(u64::MAX);
+    let (network, _a, mut b) = ready_pair(u64::MAX);
     let feedback = Feedback::nack(BlockId::new(8), 3, 1);
     let body = encode_reliability_feedback(feedback);
     network.inject(
@@ -1084,7 +1150,6 @@ fn receive_demux_uses_payload_len_instead_of_qos_class() {
 fn t16_backward_clock_jump_resets_pacing_and_notifies_controller() {
     let network = SimNetwork::new();
     let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, 1_000, None);
-    a.establish_for_test(31, 1).unwrap();
     a.enqueue_file_data(payload_packet([1; 80])).unwrap();
     a.enqueue_file_data(payload_packet([2; 80])).unwrap();
 
@@ -1113,7 +1178,6 @@ fn drive_calls_the_single_controller_clock_entry() {
         Box::new(controller),
         None,
     );
-    endpoint.establish_for_test(0x4040, 1).unwrap();
 
     assert_eq!(endpoint.next_wakeup(), Some(ms(20)));
     endpoint.drive(ms(19));
@@ -1128,6 +1192,14 @@ fn drive_calls_the_single_controller_clock_entry() {
 }
 
 #[test]
+fn drive_report_exposes_no_controller_wakeup_when_none_is_armed() {
+    let (_network, mut a, _b) = ready_pair(1_000);
+    let report = a.drive(ms(1));
+    assert_eq!(report.next_wakeup, None);
+    assert_eq!(a.next_wakeup(), None);
+}
+
+#[test]
 fn inbound_readiness_interrupts_a_longer_pacer_wait_once() {
     let inbound = Arc::new(Mutex::new(VecDeque::new()));
     let waits = Arc::new(Mutex::new(Vec::new()));
@@ -1136,7 +1208,6 @@ fn inbound_readiness_interrupts_a_longer_pacer_wait_once() {
         waits: Arc::clone(&waits),
     };
     let mut endpoint = UdpLiEndpoint::new(transport, EndpointConfig::new(Role::Initiator, 1_000));
-    endpoint.establish_for_test(0x9191, 1).unwrap();
     endpoint
         .enqueue_file_data(payload_packet(b"first packet"))
         .unwrap();
@@ -1182,7 +1253,7 @@ fn inbound_readiness_interrupts_a_longer_pacer_wait_once() {
 
 #[test]
 fn t17_restart_bumps_epoch_clears_queues_and_drops_old_epoch() {
-    let (_network, mut a, mut b) = established_pair(u64::MAX);
+    let (_network, mut a, mut b) = ready_pair(u64::MAX);
     a.enqueue_file_data(payload_packet(b"old-epoch")).unwrap();
     a.drive(ms(10));
     a.enqueue_file_data(payload_packet(b"queued-old")).unwrap();
@@ -1207,37 +1278,25 @@ fn t17_restart_bumps_epoch_clears_queues_and_drops_old_epoch() {
 }
 
 #[test]
-fn t19_enqueue_before_established_is_not_admitted_or_delivered() {
+fn t19_data_and_feedback_are_admitted_without_establishing() {
     let network = SimNetwork::new();
     let mut a = endpoint(&network, 0, Role::Initiator, 1_000);
-    let error = a
-        .enqueue_file_data(payload_packet(b"too-early"))
-        .unwrap_err();
-    assert_eq!(
-        error.kind(),
-        ProfileEnqueueErrorKind::EnqueueBeforeEstablished
-    );
-    assert_eq!(a.queued(SendClass::FileData), 0);
-    let feedback_error = a
-        .enqueue_feedback_value(Feedback::ack(BlockId::new(1)))
-        .unwrap_err();
-    assert_eq!(
-        feedback_error.kind(),
-        ProfileEnqueueErrorKind::EnqueueBeforeEstablished
-    );
-    assert_eq!(a.queued(SendClass::Feedback), 0);
+    a.enqueue_file_data(payload_packet(b"immediate")).unwrap();
+    a.enqueue_feedback_value(Feedback::ack(BlockId::new(1)))
+        .unwrap();
+    assert_eq!(a.queued(SendClass::FileData), 1);
+    assert_eq!(a.queued(SendClass::Feedback), 1);
 
     let mut b = endpoint(&network, 1, Role::Responder, 1_000);
-    network.inject(1, data_frame(1, 0, b"remote-too-early"), false);
-    let report = b.drive(MonoNs::ZERO);
-    assert_eq!(report.dropped, 1);
-    assert_eq!(b.drop_count("not_established"), 1);
-    assert!(b.take_received().is_empty());
+    network.inject(1, data_frame(1, 0, b"remote-immediate"), false);
+    a.drive(MonoNs::ZERO);
+    b.drive(MonoNs::ZERO);
+    assert_eq!(b.take_received().len(), 2);
 }
 
 #[test]
 fn t20_boundary_lengths_drive_pacing_and_observations_consistently() {
-    let (network, mut a, mut b) = established_pair(1_000);
+    let (network, mut a, mut b) = ready_pair(1_000);
     a.enqueue_file_data(payload_packet([1; 80])).unwrap();
     a.enqueue_feedback_value(Feedback::ack(BlockId::new(5)))
         .unwrap();
@@ -1278,16 +1337,17 @@ fn t20_boundary_lengths_drive_pacing_and_observations_consistently() {
 }
 
 #[test]
-fn m7_send_failure_and_receive_completion_are_observed_once() {
+fn m7_would_block_and_receive_completion_are_observed_once() {
     let network = SimNetwork::new();
     let (mut a, evidence) = recording_endpoint(&network, 0, Role::Initiator, u64::MAX, None);
-    a.establish_for_test(77, 1).unwrap();
     a.enqueue_file_data(payload_packet(b"send-me")).unwrap();
     network.inject(0, data_frame(1, 3, b"receive-me"), true);
     network.fail_next_send(0);
 
     let report = a.drive(ms(1));
+    assert!(report.send_would_block);
     assert!(report.send_failed);
+    assert_eq!(report.send_outcome, Some(LocalSendOutcome::WouldBlock));
     assert_eq!(report.sent, 0);
     assert_eq!(report.received, 1);
     assert_eq!(report.dropped, 0);
@@ -1299,12 +1359,13 @@ fn m7_send_failure_and_receive_completion_are_observed_once() {
 
     let retry = a.drive(ms(2));
     assert_eq!(retry.sent, 1);
+    assert_eq!(retry.send_outcome, Some(LocalSendOutcome::Accepted));
     assert_eq!(evidence.lock().unwrap().sent.len(), 1);
 }
 
 #[test]
 #[ignore = "gated loopback conformance; never binds a non-loopback interface"]
-fn loopback_udp_handshake_and_data() {
+fn loopback_udp_immediate_data() {
     use conet_udp::LoopbackUdpTransport;
     use std::net::UdpSocket;
     use std::time::Duration;
@@ -1323,20 +1384,10 @@ fn loopback_udp_handshake_and_data() {
         transport_b,
         EndpointConfig::new(Role::Responder, 1_000_000).test_open(),
     );
-    a.start_association().unwrap();
 
-    let started = std::time::Instant::now();
     let mut now = MonoNs::ZERO;
-    while (a.state() != AssociationState::Established || b.state() != AssociationState::Established)
-        && started.elapsed() < Duration::from_secs(2)
-    {
-        a.drive(now);
-        b.drive(now);
-        std::thread::sleep(Duration::from_millis(1));
-        now = now.saturating_add(ms(1));
-    }
-    assert_eq!(a.state(), AssociationState::Established);
-    assert_eq!(b.state(), AssociationState::Established);
+    assert_eq!(a.state(), AssociationState::Ready);
+    assert_eq!(b.state(), AssociationState::Ready);
 
     let foreign = UdpSocket::bind("127.0.0.1:0").unwrap();
     foreign.send_to(b"foreign-peer", addr_b).unwrap();

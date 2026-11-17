@@ -2,7 +2,7 @@
 
 Conet is an experimental Rust transport stack built over UDP for networking and congestion-control research. It provides modular components for link transport, pluggable congestion control, fountain coding, multiplexing, transfer, and simulation.
 
-`v0.1.0` — Experimental research release. APIs and wire formats may change; not intended for production deployment.
+`v0.1.1` — Experimental research release. APIs and wire formats may change; not intended for production deployment.
 
 Copyright © 2024–2026 Shenghao Yang.
 
@@ -25,7 +25,11 @@ cargo build -p conet_transfer --release
 cargo run -p conet_transfer -- simulate /path/to/file.txt --output /tmp/out.bin
 ```
 
-See [docs/conet-getting-started.md](docs/conet-getting-started.md).
+See [docs/conet-getting-started.md](docs/conet-getting-started.md) (build / CLI),
+[docs/conet-design-overview.md](docs/conet-design-overview.md) (structure / how
+paths are formed), and
+[docs/user/conet-transfer.md](docs/user/conet-transfer.md) for two-host / NAT
+transfer.
 
 ## Release limitations
 
@@ -51,6 +55,29 @@ Without a signed commercial agreement, AGPL-3.0-only applies.
 
 Index: [`LICENSE`](LICENSE).
 
-## Status
+## Maintenance
 
-Outside code contributions are not accepted at this time.
+This is a research codebase maintained on a **best-effort** basis. There is no
+support SLA, no guaranteed response time, and no commitment to backward
+compatibility within `0.x`. Issues and questions may be answered when time
+allows; outside code pull requests are not accepted at this time.
+
+## Citation
+
+If you use Conet in coursework or research, please cite this software (not
+only a fork or mirror), including the version:
+
+> Shenghao Yang. *conet*: an experimental Rust transport stack for coded
+> networking and congestion-control research, version 0.1.1, 2026.
+> https://github.com/shhyang/conet
+
+```bibtex
+@software{yang2026conet,
+  author  = {Yang, Shenghao},
+  title   = {conet: an experimental Rust transport stack for coded networking
+             and congestion-control research},
+  version = {0.1.1},
+  year    = {2026},
+  url     = {https://github.com/shhyang/conet}
+}
+```

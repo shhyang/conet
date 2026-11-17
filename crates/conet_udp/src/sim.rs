@@ -31,7 +31,7 @@ struct Delivery {
 #[derive(Debug, Default)]
 struct HostPath {
     deliveries: VecDeque<Delivery>,
-    fail_next_sends: usize,
+    send_errors: VecDeque<io::ErrorKind>,
     loss_pattern: VecDeque<bool>,
     latency_pattern: VecDeque<MonoNs>,
 }
@@ -91,7 +91,12 @@ impl SimNetwork {
     }
 
     pub fn fail_next_send(&self, from: usize) {
-        self.lock().paths[from].fail_next_sends += 1;
+        self.fail_next_send_with(from, io::ErrorKind::WouldBlock);
+    }
+
+    /// Inject one deterministic sender-side error of an explicit kind.
+    pub fn fail_next_send_with(&self, from: usize, kind: io::ErrorKind) {
+        self.lock().paths[from].send_errors.push_back(kind);
     }
 
     /// Replace the deterministic loss pattern for datagrams from `from`.
@@ -166,11 +171,10 @@ impl DatagramTransport for SimTransport {
         self.counters.record_syscall();
         let mut state = self.lock();
         let path = &mut state.paths[self.from];
-        if path.fail_next_sends > 0 {
-            path.fail_next_sends -= 1;
+        if let Some(kind) = path.send_errors.pop_front() {
             return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "injected simulator sendto failure",
+                kind,
+                format!("injected simulator sendto failure: {kind}"),
             ));
         }
 

@@ -75,6 +75,14 @@ struct RunEvidence {
 }
 
 #[test]
+fn t1_one_way_open_loop_recovers_and_stops_on_counter() {
+    let (sender, receiver) = paced_identity_link(link_limits(), 1_000);
+    let evidence = run_one_way(sender, receiver);
+    assert_eq!(evidence.object, b"one-way-object-recovered");
+    assert_eq!(evidence.status, conet_core::BlockStatus::StoppedByBudget);
+}
+
+#[test]
 fn g1_same_core_completes_on_simulator_and_device_stub() {
     let (simulator, sim_receiver) = paced_identity_link(link_limits(), 1_000);
     let (device, device_receiver) = device_stub_link(link_limits(), 1_000);
@@ -87,3 +95,10 @@ fn g1_same_core_completes_on_simulator_and_device_stub() {
     );
 }
 
+#[test]
+fn g6_one_way_policy_stops_without_ack_path() {
+    let (sender, receiver) = device_stub_link(link_limits(), 1_000);
+    let evidence = run_one_way(sender, receiver);
+    assert_eq!(evidence.generated, 7);
+    assert_eq!(evidence.status, conet_core::BlockStatus::StoppedByBudget);
+}

@@ -1,7 +1,7 @@
 use conet_core::{
     BackingAccounting, EnqueueErrorKind, FanoutSender, ForwardError, ForwardOutcome,
     IdentityForwarder, InProcessLink, LinkEndpoint, LinkReceiver, LinkSender, MonoNs,
-    PacketBuilder, PacketHandle, PacketMetrics, PayloadCopyCounter, QueueLimits,
+    PacketBuilder, PacketHandle, PacketMetrics, PacketQueue, PayloadCopyCounter, QueueLimits,
     identity_link, paced_identity_link,
 };
 
@@ -69,6 +69,22 @@ fn m1_and_m10_three_identity_devices_forward_same_backing_without_copy() {
     assert_eq!(received.payload_bytes(), b"through-chain");
     assert_eq!(copies.count(), 0);
     assert_eq!(received.payload_copies().count(), 0);
+}
+
+#[test]
+fn m10_pure_forwarding_in_process_keeps_copy_counter_at_zero() {
+    let copies = PayloadCopyCounter::new();
+    let mut queue = PacketQueue::new(limits(2));
+    queue
+        .enqueue(packet_with(
+            b"queue-forward",
+            BackingAccounting::new(),
+            copies.clone(),
+        ))
+        .unwrap();
+    let forwarded = queue.dequeue().unwrap();
+    assert_eq!(forwarded.payload_bytes(), b"queue-forward");
+    assert_eq!(copies.count(), 0);
 }
 
 #[test]
@@ -180,3 +196,8 @@ fn g2_backpressure_from_bounded_sink_reaches_producer_through_chain() {
     assert_eq!(copies.count(), 0);
 }
 
+#[test]
+fn packet_handle_is_send_and_static() {
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_static::<PacketHandle>();
+}

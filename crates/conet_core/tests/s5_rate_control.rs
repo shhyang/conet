@@ -1,11 +1,26 @@
 use conet_core::{
-    AppliedDecision, ByteRate, Clock, ControlDisposition, LinkCaps, LinkReceiver, LinkSender,
-    MonoNs, OpaqueBytes, Pace, PacketBuilder, PacketClass, PacketHandle, QueueLimits,
-    RateControlPolicy, TxController, VirtualClock, device_stub_link, paced_identity_link,
+    AppliedDecision, BackingAccounting, ByteRate, Clock, ControlDisposition, FixedRateController,
+    LinkCaps, LinkReceiver, LinkSender, MonoNs, OpaqueBytes, Pace, PacketBuilder, PacketClass,
+    PacketHandle, PacketMetrics, PayloadCopyCounter, QueueLimits, RateControlPolicy, TxController,
+    VirtualClock, device_stub_link, paced_identity_link,
 };
 
 fn limits(packets: usize) -> QueueLimits {
     QueueLimits::new(packets, 32_768, 32_768)
+}
+
+fn packet_with(
+    payload: &[u8],
+    accounting: BackingAccounting,
+    copies: PayloadCopyCounter,
+) -> PacketHandle {
+    let metrics = PacketMetrics {
+        backings: accounting,
+        payload_copies: copies,
+    };
+    let mut builder = PacketBuilder::with_capacity_and_metrics(payload.len(), 4, metrics);
+    builder.payload_mut().copy_from_slice(payload);
+    builder.freeze()
 }
 
 fn packet(len: usize, fill: u8) -> PacketHandle {
@@ -72,6 +87,35 @@ fn g4_pacer_reuse_matches_between_simulator_and_device_stub() {
     assert!(device.caps().paced);
     assert!(!unpaced.caps().paced);
     assert_eq!(unpaced.caps(), LinkCaps::UNPACED_IN_PROCESS);
+}
+
+#[test]
+fn g5_fixed_rate_controller_ignores_bodies_and_exposes_its_pace() {
+    let rate: ByteRate = 2_000;
+    let mut controller = FixedRateController::new(rate);
+    controller.on_peer_control(
+        nanos(10),
+        OpaqueBytes::from_static(b"peer asks for 999999 bytes/s"),
+    );
+    assert_eq!(controller.pace(), Pace::set_target_rate(rate));
+    controller.on_clock(nanos(20));
+    assert_eq!(controller.poll_control(nanos(35)), None);
+
+    let (mut link, _sink) = paced_identity_link(limits(2), rate);
+    let applied = link.handle_peer_control(
+        &mut controller,
+        nanos(40),
+        OpaqueBytes::from_static(b"still opaque"),
+        RateControlPolicy::test_allow_unauthenticated_cc(),
+    );
+    assert_eq!(
+        applied,
+        AppliedDecision::Applied {
+            bytes_per_sec: Some(rate),
+            inflight_limit_bytes: None,
+        }
+    );
+    assert_eq!(link.target_rate(), rate);
 }
 
 struct SuggestRateController {
@@ -224,3 +268,20 @@ fn t2_mixed_classes_debit_one_pacer_budget() {
     assert_eq!(third.payload_bytes(), &[0x33; 500]);
 }
 
+#[test]
+fn paced_composition_preserves_backing_and_payload_copy_count() {
+    let copies = PayloadCopyCounter::new();
+    let payload = vec![0x7a; 900];
+    let pkt = packet_with(&payload, BackingAccounting::new(), copies.clone());
+    let backing_id = pkt.backing_id();
+    let (mut source, mut sink) = paced_identity_link(limits(2), 1_000);
+
+    source.enqueue(pkt).unwrap();
+    assert_eq!(source.drive(MonoNs::ZERO).len(), 1);
+
+    let received = sink.recv().unwrap();
+    assert_eq!(received.backing_id(), backing_id);
+    assert_eq!(received.payload_bytes(), payload);
+    assert_eq!(copies.count(), 0);
+    assert_eq!(received.payload_copies().count(), 0);
+}

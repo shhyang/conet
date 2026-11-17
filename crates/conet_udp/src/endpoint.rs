@@ -1,4 +1,4 @@
-//! UDP-LI endpoint: association, profile queues, scheduling, and demux.
+//! UDP-LI endpoint: profile queues, scheduling, and datagram demux.
 
 use std::collections::VecDeque;
 use std::io;
@@ -12,16 +12,11 @@ use conet_core::{
     WireHeader,
 };
 
-use crate::OpenState;
-use crate::association::{
-    AssociationError, AssociationState, HandshakePolicy, OpenStateBody, Role, UDP_LI_PROFILE_ID,
-    make_open_state,
-};
+use crate::association::{AssociationError, AssociationState, Role};
 use crate::scheduler::{ControlWindow, SchedulerConfig, SendClass};
 use crate::transport::{DatagramTransport, InboundDatagram, WireIoStats};
 
 const WIRE_HEADER_LEN: usize = conet_core::REFERENCE_WIRE_HEADER_LEN;
-const LINK_CONTROL_PREFIX_LEN: usize = 5;
 const CC_PREFIX_LEN: usize = 1;
 
 /// Profile configuration. Security remains fail-closed by default.
@@ -36,14 +31,12 @@ pub struct EndpointConfig {
     /// authenticity. CC controller input remains fail-closed. Production
     /// profiles leave this false.
     pub allow_unauthenticated_cc: bool,
-    pub handshake: HandshakePolicy,
     pub scheduler: SchedulerConfig,
-    pub association_limits: QueueLimits,
     pub link_control_limits: QueueLimits,
     pub feedback_limits: QueueLimits,
     pub file_data_limits: QueueLimits,
     pub inbound_limit: usize,
-    /// Local accounting/nonce seed for new handshakes; never serialized.
+    /// Start of the local diagnostic association-ID sequence; never serialized.
     pub initial_association_id: u32,
 }
 
@@ -64,10 +57,7 @@ impl EndpointConfig {
             max_piggyback: 256,
             max_control_body: 256,
             allow_unauthenticated_cc: false,
-            handshake: HandshakePolicy::default(),
             scheduler: SchedulerConfig::default(),
-            association_limits: QueueLimits::new(32, 32 * 1024, 32 * 1024)
-                .with_max_packet_bytes(packet_max),
             link_control_limits: QueueLimits::new(32, 32 * 1024, 32 * 1024)
                 .with_max_packet_bytes(packet_max),
             feedback_limits: QueueLimits::new(16, 32 * 1024, 32 * 1024)
@@ -86,18 +76,12 @@ impl EndpointConfig {
     }
 }
 
-/// User payload or feedback attempted before the association reached
-/// `Established`.
-#[derive(Debug)]
-pub struct EnqueueBeforeEstablished {
-    pub pkt: PacketHandle,
-    pub state: AssociationState,
-}
-
 /// Profile enqueue/admission error. Every variant retains the caller's handle.
 #[derive(Debug)]
 pub enum ProfileEnqueueError {
-    EnqueueBeforeEstablished(EnqueueBeforeEstablished),
+    Closed {
+        pkt: PacketHandle,
+    },
     Queue(EnqueueError),
     DatagramTooLarge {
         pkt: PacketHandle,
@@ -112,16 +96,9 @@ pub enum ProfileEnqueueError {
 }
 
 impl ProfileEnqueueError {
-    pub fn stage_established(&self) -> Option<AssociationState> {
-        match self {
-            Self::EnqueueBeforeEstablished(error) => Some(error.state),
-            _ => None,
-        }
-    }
-
     pub fn kind(&self) -> ProfileEnqueueErrorKind {
         match self {
-            Self::EnqueueBeforeEstablished(_) => ProfileEnqueueErrorKind::EnqueueBeforeEstablished,
+            Self::Closed { .. } => ProfileEnqueueErrorKind::Closed,
             Self::Queue(error) => ProfileEnqueueErrorKind::Queue(error.kind()),
             Self::DatagramTooLarge { .. } => ProfileEnqueueErrorKind::DatagramTooLarge,
             Self::ControlBodyTooLarge { .. } => ProfileEnqueueErrorKind::ControlBodyTooLarge,
@@ -130,7 +107,7 @@ impl ProfileEnqueueError {
 
     pub fn packet(&self) -> &PacketHandle {
         match self {
-            Self::EnqueueBeforeEstablished(error) => &error.pkt,
+            Self::Closed { pkt } => pkt,
             Self::Queue(error) => error.packet(),
             Self::DatagramTooLarge { pkt, .. } | Self::ControlBodyTooLarge { pkt, .. } => pkt,
         }
@@ -138,7 +115,7 @@ impl ProfileEnqueueError {
 
     pub fn into_packet(self) -> PacketHandle {
         match self {
-            Self::EnqueueBeforeEstablished(error) => error.pkt,
+            Self::Closed { pkt } => pkt,
             Self::Queue(error) => error.into_packet(),
             Self::DatagramTooLarge { pkt, .. } | Self::ControlBodyTooLarge { pkt, .. } => pkt,
         }
@@ -148,7 +125,7 @@ impl ProfileEnqueueError {
 /// Non-owning failure classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileEnqueueErrorKind {
-    EnqueueBeforeEstablished,
+    Closed,
     Queue(EnqueueErrorKind),
     DatagramTooLarge,
     ControlBodyTooLarge,
@@ -157,13 +134,7 @@ pub enum ProfileEnqueueErrorKind {
 impl std::fmt::Display for ProfileEnqueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EnqueueBeforeEstablished(error) => {
-                write!(
-                    f,
-                    "user payload or feedback is not admitted before Established (state {:?})",
-                    error.state
-                )
-            }
+            Self::Closed { .. } => f.write_str("UDP-LI endpoint is closed"),
             Self::Queue(error) => error.fmt(f),
             Self::DatagramTooLarge { len, max, .. } => {
                 write!(f, "UDP payload length {len} exceeds profile maximum {max}")
@@ -189,6 +160,25 @@ pub struct SentDatagram {
     pub ready_at: MonoNs,
 }
 
+/// Explicit result of one local datagram send attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalSendOutcome {
+    /// The transport completed a full local write. Only this outcome consumes
+    /// a link sequence and updates sent/controller/pacer accounting.
+    Accepted,
+    /// The socket could not accept the write due to local backpressure. The
+    /// front item remains queued with its provisional sequence cleared.
+    WouldBlock,
+    /// A transient ICMP/unreachable error rejected the write. The attempted
+    /// datagram is dropped locally and is not retried by the link.
+    TransientDrop,
+    /// A local syscall was interrupted before socket acceptance. The front
+    /// item remains queued for a later attempt.
+    Interrupted,
+    /// A hard serialization, configuration, socket, or I/O error.
+    Fatal,
+}
+
 /// One validated datagram delivered upward.
 #[derive(Debug)]
 pub struct ReceivedDatagram {
@@ -206,8 +196,13 @@ pub struct DriveReport {
     pub sent: usize,
     pub received: usize,
     pub dropped: usize,
+    /// The final local send attempt in this drive did not write successfully.
     pub send_failed: bool,
-    pub association_failed: bool,
+    /// A local send hit backpressure; the front item remains queued and was
+    /// not reported to the controller or transfer accounting as sent.
+    pub send_would_block: bool,
+    /// Explicit classification of the final local send attempt.
+    pub send_outcome: Option<LocalSendOutcome>,
     pub clock_discontinuity: bool,
     /// Transport-near counters observed when this drive completed.
     pub wire_io: WireIoStats,
@@ -217,156 +212,20 @@ pub struct DriveReport {
 
 #[derive(Clone, Copy, Debug)]
 enum ControlSpec {
-    Link {
-        ctrl_type: ControlType,
-        ctrl_seq: u32,
-    },
-    Cc {
-        ctrl_type: ControlType,
-    },
+    Cc { ctrl_type: ControlType },
 }
 
 impl ControlSpec {
     const fn ctrl_type(self) -> ControlType {
         match self {
-            Self::Link { ctrl_type, .. } | Self::Cc { ctrl_type } => ctrl_type,
+            Self::Cc { ctrl_type } => ctrl_type,
         }
     }
 
     const fn prefix_len(self) -> usize {
         match self {
-            Self::Link { .. } => LINK_CONTROL_PREFIX_LEN,
             Self::Cc { .. } => CC_PREFIX_LEN,
         }
-    }
-}
-
-const CONTROL_REPLAY_WINDOW_BITS: u32 = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlSeqDisposition {
-    Accepted,
-    Duplicate,
-    TooOld,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ControlReplayWindow {
-    max_seq: u32,
-    seen: u64,
-    initialized: bool,
-}
-
-impl ControlReplayWindow {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn inspect(&self, seq: u32) -> ControlSeqDisposition {
-        if !self.initialized {
-            return ControlSeqDisposition::Accepted;
-        }
-        let ahead = seq.wrapping_sub(self.max_seq);
-        if ahead == 0 {
-            return ControlSeqDisposition::Duplicate;
-        }
-        if ahead & (1 << 31) == 0 {
-            return ControlSeqDisposition::Accepted;
-        }
-        let behind = self.max_seq.wrapping_sub(seq);
-        if behind >= CONTROL_REPLAY_WINDOW_BITS {
-            return ControlSeqDisposition::TooOld;
-        }
-        if self.seen & (1_u64 << behind) != 0 {
-            ControlSeqDisposition::Duplicate
-        } else {
-            ControlSeqDisposition::Accepted
-        }
-    }
-
-    /// Record a control sequence and report whether this is its first arrival.
-    ///
-    /// A 64-entry sliding bitmap admits bounded reordering and retains no
-    /// unbounded per-control history.
-    fn accept(&mut self, seq: u32) -> ControlSeqDisposition {
-        let disposition = self.inspect(seq);
-        if disposition != ControlSeqDisposition::Accepted {
-            return disposition;
-        }
-
-        if !self.initialized {
-            self.initialized = true;
-            self.max_seq = seq;
-            self.seen = 1;
-            return ControlSeqDisposition::Accepted;
-        }
-
-        let ahead = seq.wrapping_sub(self.max_seq);
-        if ahead & (1 << 31) == 0 {
-            self.seen = if ahead >= CONTROL_REPLAY_WINDOW_BITS {
-                1
-            } else {
-                (self.seen << ahead) | 1
-            };
-            self.max_seq = seq;
-            return ControlSeqDisposition::Accepted;
-        }
-
-        let behind = self.max_seq.wrapping_sub(seq);
-        let mask = 1_u64 << behind;
-        self.seen |= mask;
-        ControlSeqDisposition::Accepted
-    }
-}
-
-#[cfg(test)]
-mod control_replay_window_tests {
-    use super::{ControlReplayWindow, ControlSeqDisposition};
-
-    #[test]
-    fn accepts_first_copy_and_rejects_an_in_window_duplicate() {
-        let mut window = ControlReplayWindow::default();
-
-        assert_eq!(window.accept(10), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(10), ControlSeqDisposition::Duplicate);
-    }
-
-    #[test]
-    fn accepts_in_window_reordering_and_fills_holes_once() {
-        let mut window = ControlReplayWindow::default();
-
-        assert_eq!(window.accept(10), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(12), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(11), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(11), ControlSeqDisposition::Duplicate);
-        assert_eq!(window.accept(12), ControlSeqDisposition::Duplicate);
-        assert_eq!(window.accept(10), ControlSeqDisposition::Duplicate);
-    }
-
-    #[test]
-    fn accepts_reordering_across_u32_wraparound() {
-        let mut window = ControlReplayWindow::default();
-
-        assert_eq!(window.accept(u32::MAX - 1), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(u32::MAX), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(0), ControlSeqDisposition::Accepted);
-        assert_eq!(
-            window.accept(u32::MAX - 1),
-            ControlSeqDisposition::Duplicate
-        );
-        assert_eq!(window.accept(u32::MAX), ControlSeqDisposition::Duplicate);
-        assert_eq!(window.accept(1), ControlSeqDisposition::Accepted);
-    }
-
-    #[test]
-    fn classifies_a_sequence_evicted_behind_the_window_as_too_old() {
-        let mut window = ControlReplayWindow::default();
-
-        assert_eq!(window.accept(100), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(163), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(100), ControlSeqDisposition::Duplicate);
-        assert_eq!(window.accept(164), ControlSeqDisposition::Accepted);
-        assert_eq!(window.accept(100), ControlSeqDisposition::TooOld);
     }
 }
 
@@ -379,6 +238,9 @@ struct ProfileQueue {
 enum SendStep {
     Sent,
     CapBlocked,
+    WouldBlock,
+    TransientDrop,
+    Interrupted,
     Failed,
 }
 
@@ -443,13 +305,6 @@ pub struct UdpLiEndpoint<T: DatagramTransport> {
     epoch: u16,
     next_association_id: u32,
     next_link_seq: u32,
-    next_ctrl_seq: u32,
-    control_replay: ControlReplayWindow,
-    open_state: Option<OpenState>,
-    open_ctrl_seq: Option<u32>,
-    open_sends: u8,
-    handshake_due: MonoNs,
-    association_queue: ProfileQueue,
     link_control_queue: ProfileQueue,
     feedback_queue: ProfileQueue,
     file_queue: ProfileQueue,
@@ -489,6 +344,7 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         tx_controller: Box<dyn TxController>,
         rx_controller: Option<Box<dyn RxController>>,
     ) -> Self {
+        let initial_association_id = config.initial_association_id;
         let wire = ReferenceWireCodec::new(conet_core::WireLimits {
             max_datagram: config.max_datagram,
             max_control_body: config.max_control_body,
@@ -498,23 +354,16 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         let receive_scratch = Vec::with_capacity(config.inbound_limit);
         Self {
             transport,
-            association_queue: ProfileQueue::new(config.association_limits),
             link_control_queue: ProfileQueue::new(config.link_control_limits),
             feedback_queue: ProfileQueue::new(config.feedback_limits),
             file_queue: ProfileQueue::new(config.file_data_limits),
-            next_association_id: config.initial_association_id,
+            next_association_id: config.initial_association_id.wrapping_add(1).max(1),
             config,
             wire,
-            association: AssociationState::Idle,
-            association_id: None,
-            epoch: 0,
+            association: AssociationState::Ready,
+            association_id: Some(initial_association_id.max(1)),
+            epoch: 1,
             next_link_seq: 0,
-            next_ctrl_seq: 1,
-            control_replay: ControlReplayWindow::default(),
-            open_state: None,
-            open_ctrl_seq: None,
-            open_sends: 0,
-            handshake_due: MonoNs::ZERO,
             pacer,
             inflight_limit_bytes: None,
             control_window: ControlWindow::default(),
@@ -571,9 +420,12 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
 
     /// Earliest time this endpoint may have useful drive work.
     ///
-    /// This aggregates the TX and RX controller hooks, a waiting pacer, and
-    /// an in-progress handshake. It deliberately does not alter
+    /// This aggregates the TX and RX controller hooks and a waiting pacer. It
+    /// deliberately does not alter
     /// [`Self::next_wakeup`], which remains the TX controller hook only.
+    /// Transport keepalive / challenge wakeups are wall-clock and are applied
+    /// in [`Self::drive_when_ready_with_timeout`] via
+    /// [`DatagramTransport::next_io_wake`].
     pub fn next_drive(&self) -> Option<MonoNs> {
         let now = self.last_now.unwrap_or(MonoNs::ZERO);
         let mut deadline = self.controller.next_wakeup();
@@ -583,9 +435,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             .and_then(|controller| controller.next_wakeup())
         {
             deadline = earliest(deadline, Some(rx_deadline));
-        }
-        if self.association == AssociationState::Handshaking {
-            deadline = earliest(deadline, Some(self.handshake_due));
         }
         if self.send_waiting(now) {
             deadline = earliest(deadline, Some(self.ready_at()));
@@ -601,18 +450,47 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
     /// early when a datagram arrives, even while the pacer or a controller
     /// deadline is further in the future.
     pub fn drive_when_ready(&mut self, mut now: impl FnMut() -> MonoNs) -> io::Result<DriveReport> {
+        self.drive_when_ready_with_timeout(&mut now, None)
+    }
+
+    /// Wait for inbound readiness, a drive deadline, or a caller-supplied cap.
+    ///
+    /// The cap bounds a wait when [`Self::next_drive`] has no deadline. It
+    /// does not synthesize or change a protocol deadline; an expired cap simply
+    /// samples the injected clock and performs one ordinary drive.
+    pub fn drive_when_ready_with_timeout(
+        &mut self,
+        mut now: impl FnMut() -> MonoNs,
+        max_wait: Option<Duration>,
+    ) -> io::Result<DriveReport> {
         let current = now();
         let deadline = self.next_drive();
-        if deadline.is_some_and(|deadline| deadline <= current) {
+        let io_wake = self.transport.next_io_wake();
+        if deadline.is_some_and(|deadline| deadline <= current)
+            || io_wake.is_some_and(|wait| wait.is_zero())
+        {
             return Ok(self.drive(current));
         }
 
-        let timeout = deadline.map(|deadline| {
+        let deadline_wait = deadline.map(|deadline| {
             let nanos = deadline.as_nanos().saturating_sub(current.as_nanos());
             Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
         });
+        let timeout = match (deadline_wait, max_wait, io_wake) {
+            (Some(a), Some(b), Some(c)) => Some(a.min(b).min(c)),
+            (Some(a), Some(b), None) => Some(a.min(b)),
+            (Some(a), None, Some(c)) => Some(a.min(c)),
+            (None, Some(b), Some(c)) => Some(b.min(c)),
+            (Some(a), None, None) => Some(a),
+            (None, Some(b), None) => Some(b),
+            (None, None, Some(c)) => Some(c),
+            (None, None, None) => None,
+        };
         let inbound_ready = self.transport.wait_readable(timeout)?;
-        let drive_at = if inbound_ready {
+        let drive_at = if inbound_ready
+            || deadline_wait.is_some_and(|wait| max_wait.is_some_and(|max_wait| max_wait < wait))
+            || io_wake.is_some()
+        {
             now()
         } else {
             deadline.unwrap_or_else(|| now())
@@ -682,15 +560,12 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             .map(|(packet, _)| packet.header().as_bytes())
     }
 
-    /// Begin an initiator association with a fresh local ID and epoch 1.
+    /// Reset the local datagram epoch and diagnostic ID.
+    ///
+    /// This sends no setup datagram; transmission is available before and
+    /// after the reset.
     pub fn start_association(&mut self) -> Result<(), AssociationError> {
         if self.config.role != Role::Initiator {
-            return Err(AssociationError::WrongRole);
-        }
-        if !matches!(
-            self.association,
-            AssociationState::Idle | AssociationState::Closed | AssociationState::Failed
-        ) {
             return Err(AssociationError::WrongState {
                 state: self.association,
             });
@@ -699,25 +574,16 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         self.association_id = Some(self.allocate_association_id());
         self.epoch = 1;
         self.next_link_seq = 0;
-        self.control_replay.clear();
-        self.open_sends = 0;
-        self.handshake_due = MonoNs::ZERO;
-        self.open_state = Some(make_open_state(
-            self.config.max_datagram,
-            nonce_from_id(self.association_id.unwrap_or(0)),
-        ));
-        self.open_ctrl_seq = Some(self.take_ctrl_seq());
-        self.association = AssociationState::Handshaking;
-        self.association_queue.clear();
-        self.enqueue_open()
-            .map_err(|_| AssociationError::WrongState {
-                state: self.association,
-            })?;
+        self.association = AssociationState::Ready;
+        self.transport.set_emit_controls(true);
         Ok(())
     }
 
-    /// Explicit test-only pre-shared association. This skips OPEN/ACCEPT and
-    /// must not be used as the shipping security path.
+    /// Legacy test helper for selecting a fixed local epoch.
+    ///
+    /// It performs no setup exchange and does not gate datagrams; newer tests
+    /// use the default ready state directly.
+    #[doc(hidden)]
     pub fn establish_for_test(
         &mut self,
         association_id: u32,
@@ -728,38 +594,35 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
                 state: self.association,
             });
         }
-        self.cancel_profile_queues();
         self.association_id = Some(association_id);
         self.epoch = epoch;
         self.next_link_seq = 0;
-        self.control_replay.clear();
-        self.open_sends = 0;
-        self.open_ctrl_seq = None;
-        self.association_queue.clear();
-        self.association = AssociationState::Established;
+        self.association = AssociationState::Ready;
         Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), AssociationError> {
-        if !self.association.is_established() {
-            return Err(AssociationError::NotEstablished {
+        if self.association.is_closed() {
+            return Err(AssociationError::WrongState {
                 state: self.association,
             });
         }
         self.cancel_profile_queues();
-        self.association = AssociationState::Closing;
-        self.enqueue_association_control(ControlType::Close, OpaqueBytes::new())
-            .map_err(|_| AssociationError::WrongState {
-                state: self.association,
-            })?;
+        self.association = AssociationState::Closed;
+        // Receive may still drain, but must not emit keepalives / challenge replies.
+        self.transport.set_emit_controls(false);
         Ok(())
     }
 
     /// In-place restart: bump epoch, reset this direction's link sequence,
     /// cancel queued reliability users, and retain the association binding.
+    ///
+    /// Validated UDP peer bindings survive. In-flight path challenges are
+    /// invalidated so a delayed prior-epoch response cannot redirect the new
+    /// epoch.
     pub fn restart(&mut self) -> Result<u16, AssociationError> {
-        if !self.association.is_established() {
-            return Err(AssociationError::NotEstablished {
+        if !self.association.is_ready() {
+            return Err(AssociationError::WrongState {
                 state: self.association,
             });
         }
@@ -776,6 +639,7 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         if let Some(controller) = self.rx_controller.as_mut() {
             controller.restart();
         }
+        self.transport.on_association_restart();
         self.apply_controller_pace(RateControlPolicy::authenticated());
         Ok(self.epoch)
     }
@@ -784,13 +648,8 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         &mut self,
         pkt: PacketHandle,
     ) -> Result<UdpLiEnqueueStatus, ProfileEnqueueError> {
-        if !self.association.is_established() {
-            return Err(ProfileEnqueueError::EnqueueBeforeEstablished(
-                EnqueueBeforeEstablished {
-                    pkt,
-                    state: self.association,
-                },
-            ));
+        if !self.association.is_ready() {
+            return Err(ProfileEnqueueError::Closed { pkt });
         }
         self.enqueue_user_class(SendClass::FileData, pkt, None)
     }
@@ -799,13 +658,8 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         &mut self,
         pkt: PacketHandle,
     ) -> Result<UdpLiEnqueueStatus, ProfileEnqueueError> {
-        if !self.association.is_established() {
-            return Err(ProfileEnqueueError::EnqueueBeforeEstablished(
-                EnqueueBeforeEstablished {
-                    pkt,
-                    state: self.association,
-                },
-            ));
+        if !self.association.is_ready() {
+            return Err(ProfileEnqueueError::Closed { pkt });
         }
         self.enqueue_user_class(SendClass::Feedback, pkt, None)
     }
@@ -836,20 +690,29 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         }
         self.last_now = Some(now);
 
-        self.controller.on_clock(now);
-        self.apply_controller_pace(RateControlPolicy::authenticated());
-        self.poll_controller_control(now);
-        self.poll_rx_control(now);
-        self.maintain_handshake(now, &mut report);
+        // Closed endpoints still drain inbound (and drop it) so callers can
+        // observe peer close, but they never enqueue or emit further datagrams.
+        if self.association.is_ready() {
+            // UL-4: transport-level NAT keepalives (outside the 10% control budget).
+            let _ = self.transport.drive_keepalive();
 
-        while self.pace_ready(now) {
-            let Some(class) = self.select_class(now) else {
-                break;
-            };
-            match self.send_one(now, class, &mut report) {
-                SendStep::Sent => {}
-                SendStep::CapBlocked => continue,
-                SendStep::Failed => break,
+            self.controller.on_clock(now);
+            self.apply_controller_pace(RateControlPolicy::authenticated());
+            self.poll_controller_control(now);
+            self.poll_rx_control(now);
+
+            while self.pace_ready(now) {
+                let Some(class) = self.select_class(now) else {
+                    break;
+                };
+                match self.send_one(now, class, &mut report) {
+                    SendStep::Sent => {}
+                    SendStep::CapBlocked => continue,
+                    SendStep::WouldBlock
+                    | SendStep::TransientDrop
+                    | SendStep::Interrupted
+                    | SendStep::Failed => break,
+                }
             }
         }
 
@@ -878,7 +741,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             self.receive_scratch = batch;
         }
         self.poll_rx_control(now);
-        self.maintain_handshake(now, &mut report);
         report.sent = self.sent.len() - sent_before;
         report.next_wakeup = self.next_wakeup();
         report.wire_io = self.wire_io_stats();
@@ -889,12 +751,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         let id = self.next_association_id;
         self.next_association_id = self.next_association_id.wrapping_add(1).max(1);
         id.max(1)
-    }
-
-    fn take_ctrl_seq(&mut self) -> u32 {
-        let seq = self.next_ctrl_seq;
-        self.next_ctrl_seq = self.next_ctrl_seq.wrapping_add(1).max(1);
-        seq
     }
 
     fn cancel_profile_queues(&mut self) -> usize {
@@ -908,7 +764,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
 
     fn queue(&self, class: SendClass) -> &ProfileQueue {
         match class {
-            SendClass::Association => &self.association_queue,
             SendClass::LinkControl => &self.link_control_queue,
             SendClass::Feedback => &self.feedback_queue,
             SendClass::FileData => &self.file_queue,
@@ -917,7 +772,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
 
     fn queue_mut(&mut self, class: SendClass) -> &mut ProfileQueue {
         match class {
-            SendClass::Association => &mut self.association_queue,
             SendClass::LinkControl => &mut self.link_control_queue,
             SendClass::Feedback => &mut self.feedback_queue,
             SendClass::FileData => &mut self.file_queue,
@@ -929,7 +783,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         class: SendClass,
     ) -> (&mut ProfileQueue, &mut Vec<u8>) {
         let queue = match class {
-            SendClass::Association => &mut self.association_queue,
             SendClass::LinkControl => &mut self.link_control_queue,
             SendClass::Feedback => &mut self.feedback_queue,
             SendClass::FileData => &mut self.file_queue,
@@ -969,38 +822,13 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         }
     }
 
-    fn maintain_handshake(&mut self, now: MonoNs, report: &mut DriveReport) {
-        if self.association != AssociationState::Handshaking {
-            return;
-        }
-        if self.open_sends >= self.config.handshake.max_sends {
-            if now >= self.handshake_due {
-                self.association = AssociationState::Failed;
-                self.association_queue.clear();
-                self.record_drop("handshake_retry_cap");
-                report.association_failed = true;
-            }
-            return;
-        }
-        if now >= self.handshake_due && self.association_queue.is_empty() {
-            let _ = self.enqueue_open();
-        }
-    }
-
     fn select_class(&mut self, now: MonoNs) -> Option<SendClass> {
-        if !self.association.is_established() {
-            return (!self.association_queue.is_empty()).then_some(SendClass::Association);
-        }
         let data_waiting = !self.file_queue.is_empty() && !self.data_blocked_by_inflight_cap(now);
         if data_waiting
             && self.consecutive_non_file >= self.config.scheduler.max_consecutive_non_file
         {
             return Some(SendClass::FileData);
         }
-        if !self.association_queue.is_empty() {
-            return Some(SendClass::Association);
-        }
-
         let feedback_waiting = !self.feedback_queue.is_empty();
         let control_waiting = !self.link_control_queue.is_empty();
         if control_waiting {
@@ -1033,8 +861,7 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
     }
 
     fn send_waiting(&self, now: MonoNs) -> bool {
-        !self.association_queue.is_empty()
-            || !self.link_control_queue.is_empty()
+        !self.link_control_queue.is_empty()
             || !self.feedback_queue.is_empty()
             || (!self.file_queue.is_empty() && !self.data_blocked_by_inflight_cap(now))
     }
@@ -1144,7 +971,7 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         } else {
             None
         };
-        let (front_control, encode_result, encoded_allocation) = {
+        let (_front_control, encode_result, encoded_allocation) = {
             let (queue, scratch) = self.queue_and_send_scratch_mut(class);
             let (header, control) = queue
                 .front_header_mut()
@@ -1167,6 +994,7 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
                 write_transmit_fields(header, 0);
             }
             self.record_drop("serialize_failed");
+            report.send_outcome = Some(LocalSendOutcome::Fatal);
             return SendStep::Failed;
         };
         self.wire_io.copies = self.wire_io.copies.saturating_add(1);
@@ -1236,37 +1064,68 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
                     link_seq: candidate_seq,
                     ready_at: self.ready_at(),
                 });
-                // A committed standalone body may become due for a same-event
-                // retry immediately. Offer it before this drive consumes
-                // inbound Status that can clear the expected effect.
+                // A newly due controller body may be offered immediately.
                 self.poll_rx_control(now);
-
-                if class == SendClass::Association {
-                    if self.association == AssociationState::Handshaking {
-                        match front_control.map(ControlSpec::ctrl_type) {
-                            Some(ControlType::Open) => {
-                                self.open_sends = self.open_sends.saturating_add(1);
-                                self.handshake_due =
-                                    now.saturating_add(self.config.handshake.retry_interval);
-                            }
-                            Some(ControlType::Accept) => {
-                                self.association = AssociationState::Established;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                report.send_outcome = Some(LocalSendOutcome::Accepted);
                 SendStep::Sent
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 let queue = self.queue_mut(class);
                 if let Some((header, _)) = queue.front_header_mut() {
                     write_transmit_fields(header, 0);
                 }
                 self.record_drop("sendto_failed");
                 report.send_failed = true;
+                report.send_outcome = Some(LocalSendOutcome::Fatal);
                 SendStep::Failed
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let queue = self.queue_mut(class);
+                if let Some((header, _)) = queue.front_header_mut() {
+                    write_transmit_fields(header, 0);
+                }
+                report.send_failed = true;
+                report.send_would_block = true;
+                report.send_outcome = Some(LocalSendOutcome::WouldBlock);
+                SendStep::WouldBlock
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                let queue = self.queue_mut(class);
+                if let Some((header, _)) = queue.front_header_mut() {
+                    write_transmit_fields(header, 0);
+                }
+                report.send_failed = true;
+                report.send_outcome = Some(LocalSendOutcome::Interrupted);
+                SendStep::Interrupted
+            }
+            Err(error) if is_transient_send_error(error.kind()) => {
+                let queue = self.queue_mut(class);
+                if let Some((header, _)) = queue.front_header_mut() {
+                    write_transmit_fields(header, 0);
+                }
+                self.drop_after_local_send_failure(class, piggyback);
+                self.record_drop("sendto_transient");
+                report.send_failed = true;
+                report.send_outcome = Some(LocalSendOutcome::TransientDrop);
+                SendStep::TransientDrop
+            }
+            Err(_) => {
+                let queue = self.queue_mut(class);
+                if let Some((header, _)) = queue.front_header_mut() {
+                    write_transmit_fields(header, 0);
+                }
+                self.record_drop("sendto_failed");
+                report.send_failed = true;
+                report.send_outcome = Some(LocalSendOutcome::Fatal);
+                SendStep::Failed
+            }
+        }
+    }
+
+    fn drop_after_local_send_failure(&mut self, class: SendClass, piggyback: bool) {
+        let _ = self.queue_mut(class).pop();
+        if piggyback {
+            let _ = self.link_control_queue.pop();
         }
     }
 
@@ -1291,47 +1150,17 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             .map_err(ProfileEnqueueError::Queue)
     }
 
-    fn enqueue_link_control_body(
-        &mut self,
-        class: SendClass,
-        ctrl_type: ControlType,
-        ctrl_seq: u32,
-        body: OpaqueBytes,
-    ) -> Result<UdpLiEnqueueStatus, ProfileEnqueueError> {
-        if body.len() > self.config.max_control_body {
-            return Err(ProfileEnqueueError::ControlBodyTooLarge {
-                pkt: bytes_packet(body.clone(), WIRE_HEADER_LEN),
-                len: body.len(),
-                max: self.config.max_control_body,
-            });
-        }
-        let total = WIRE_HEADER_LEN + LINK_CONTROL_PREFIX_LEN + body.len();
-        if total > self.config.max_datagram {
-            return Err(ProfileEnqueueError::DatagramTooLarge {
-                pkt: bytes_packet(body, WIRE_HEADER_LEN),
-                len: total,
-                max: self.config.max_datagram,
-            });
-        }
-        let mut pkt = bytes_packet(body, WIRE_HEADER_LEN);
-        self.initialize_header(&mut pkt, QosClass::Control, Some(0));
-        self.queue_mut(class)
-            .enqueue(
-                pkt,
-                Some(ControlSpec::Link {
-                    ctrl_type,
-                    ctrl_seq,
-                }),
-            )
-            .map_err(ProfileEnqueueError::Queue)
-    }
-
     fn enqueue_cc_body(
         &mut self,
         class: SendClass,
         ctrl_type: ControlType,
         body: OpaqueBytes,
     ) -> Result<UdpLiEnqueueStatus, ProfileEnqueueError> {
+        if !self.association.is_ready() {
+            return Err(ProfileEnqueueError::Closed {
+                pkt: bytes_packet(body, WIRE_HEADER_LEN),
+            });
+        }
         if body.len() > self.config.max_control_body {
             return Err(ProfileEnqueueError::ControlBodyTooLarge {
                 pkt: bytes_packet(body.clone(), WIRE_HEADER_LEN),
@@ -1352,43 +1181,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         self.queue_mut(class)
             .enqueue(pkt, Some(ControlSpec::Cc { ctrl_type }))
             .map_err(ProfileEnqueueError::Queue)
-    }
-
-    fn enqueue_open(&mut self) -> Result<UdpLiEnqueueStatus, EnqueueError> {
-        let Some(open) = self.open_state else {
-            return Err(EnqueueError::Closed {
-                pkt: bytes_packet(OpaqueBytes::new(), WIRE_HEADER_LEN),
-            });
-        };
-        let body = OpenStateBody {
-            profile_id: open.profile_id,
-            max_datagram: open.max_datagram,
-            nonce: open.nonce,
-        }
-        .encode();
-        let Some(ctrl_seq) = self.open_ctrl_seq else {
-            return Err(EnqueueError::Closed {
-                pkt: bytes_packet(OpaqueBytes::new(), WIRE_HEADER_LEN),
-            });
-        };
-        let mut pkt = bytes_packet(body, WIRE_HEADER_LEN);
-        self.initialize_header(&mut pkt, QosClass::Control, Some(0));
-        self.association_queue.enqueue(
-            pkt,
-            Some(ControlSpec::Link {
-                ctrl_type: ControlType::Open,
-                ctrl_seq,
-            }),
-        )
-    }
-
-    fn enqueue_association_control(
-        &mut self,
-        ctrl_type: ControlType,
-        body: OpaqueBytes,
-    ) -> Result<UdpLiEnqueueStatus, ProfileEnqueueError> {
-        let ctrl_seq = self.take_ctrl_seq();
-        self.enqueue_link_control_body(SendClass::Association, ctrl_type, ctrl_seq, body)
     }
 
     fn initialize_header(&self, pkt: &mut PacketHandle, qos: QosClass, payload_len: Option<usize>) {
@@ -1419,34 +1211,17 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         };
         drop(io_lease);
         let (packet, header, mut control) = parsed.into_parts();
+        if self.association.is_closed() {
+            self.record_drop("closed");
+            return false;
+        }
         if let Some(message) = &control {
-            let ctrl_type = message.ctrl_type;
-            match ctrl_type {
-                ControlType::Open => {
-                    if !self
-                        .control_admissible(datagram.authenticated, "unauthenticated_association")
-                    {
-                        return false;
-                    }
-                    return self.receive_open(
-                        now,
-                        datagram.authenticated,
-                        boundary_len,
-                        (packet, header, control),
-                    );
-                }
-                ControlType::Accept => {
-                    if !self
-                        .control_admissible(datagram.authenticated, "unauthenticated_association")
-                    {
-                        return false;
-                    }
-                    return self.receive_accept(
-                        now,
-                        datagram.authenticated,
-                        boundary_len,
-                        (packet, header, control),
-                    );
+            match message.ctrl_type {
+                ControlType::Open | ControlType::Accept => {
+                    // Legacy setup types are inert. They neither establish
+                    // state nor gate any datagram, so a peer that still emits
+                    // them cannot delay an unreliable path.
+                    control = None;
                 }
                 ControlType::Close | ControlType::CloseAck => {
                     if !self
@@ -1462,42 +1237,8 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
                         self.record_drop("future_epoch");
                         return false;
                     }
-                    let ctrl_seq = control
-                        .as_ref()
-                        .expect("control branch has a control message")
-                        .link_seq()
-                        .expect("link control has a sequence");
-                    let disposition = self.accept_control_seq(ctrl_seq);
-                    if disposition != ControlSeqDisposition::Accepted {
-                        return self.handle_rejected_control(
-                            now,
-                            datagram.authenticated,
-                            boundary_len,
-                            packet,
-                            header,
-                            disposition,
-                        );
-                    }
-                    self.accept_valid_datagram(
-                        now,
-                        datagram.authenticated,
-                        boundary_len,
-                        packet,
-                        header,
-                        control,
-                        None,
-                    );
-                    if ctrl_type == ControlType::CloseAck {
-                        if self.association == AssociationState::Closing {
-                            self.association = AssociationState::Closed;
-                            self.cancel_profile_queues();
-                        }
-                    } else {
-                        let _ = self
-                            .enqueue_association_control(ControlType::CloseAck, OpaqueBytes::new());
-                        self.association = AssociationState::Closed;
-                        self.cancel_profile_queues();
-                    }
+                    self.association = AssociationState::Closed;
+                    self.cancel_profile_queues();
                     return true;
                 }
                 ControlType::CcOpaque => {}
@@ -1505,10 +1246,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             }
         }
 
-        if !self.association.is_established() {
-            self.record_drop("not_established");
-            return false;
-        }
         if header.epoch < self.epoch {
             self.record_drop("stale_epoch");
             return false;
@@ -1559,188 +1296,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
         true
     }
 
-    fn receive_open(
-        &mut self,
-        now: MonoNs,
-        authenticated: bool,
-        boundary_len: usize,
-        parsed: (PacketHandle, WireHeader, Option<ControlMessage>),
-    ) -> bool {
-        if self.config.role != Role::Responder {
-            self.record_drop("unexpected_open");
-            return false;
-        }
-        let (packet, header, control) = parsed;
-        let Some(body) = control
-            .as_ref()
-            .and_then(|message| OpenStateBody::decode(&message.body))
-        else {
-            self.record_drop("malformed_open");
-            return false;
-        };
-        if body.profile_id != UDP_LI_PROFILE_ID
-            || body.max_datagram as usize > self.config.max_datagram
-        {
-            self.record_drop("open_profile_mismatch");
-            return false;
-        }
-
-        let starts_new_association = matches!(
-            self.association,
-            AssociationState::Idle | AssociationState::Failed | AssociationState::Closed
-        );
-        let ctrl_seq = control
-            .as_ref()
-            .expect("Open branch has a control message")
-            .link_seq()
-            .expect("Open has a link sequence");
-        match self.association {
-            AssociationState::Idle | AssociationState::Failed | AssociationState::Closed => {}
-            AssociationState::Established | AssociationState::Handshaking => {
-                if header.epoch != self.epoch
-                    || self.open_state.map(|open| open.nonce) != Some(body.nonce)
-                {
-                    self.record_drop("association_mismatch");
-                    return false;
-                }
-            }
-            AssociationState::Closing => {
-                let disposition = self.control_replay.inspect(ctrl_seq);
-                if disposition != ControlSeqDisposition::Accepted {
-                    return self.handle_rejected_control(
-                        now,
-                        authenticated,
-                        boundary_len,
-                        packet,
-                        header,
-                        disposition,
-                    );
-                }
-                self.record_drop("association_closing");
-                return false;
-            }
-        }
-
-        if starts_new_association {
-            self.control_replay.clear();
-        }
-        let disposition = self.accept_control_seq(ctrl_seq);
-        if disposition != ControlSeqDisposition::Accepted {
-            return self.handle_rejected_control(
-                now,
-                authenticated,
-                boundary_len,
-                packet,
-                header,
-                disposition,
-            );
-        }
-
-        if starts_new_association {
-            self.cancel_profile_queues();
-            self.epoch = header.epoch;
-            self.next_link_seq = 0;
-            self.open_state = Some(OpenState {
-                profile_id: body.profile_id,
-                max_datagram: body.max_datagram,
-                nonce: body.nonce,
-            });
-            self.association = AssociationState::Handshaking;
-        }
-
-        let Some(open) = self.open_state else {
-            self.record_drop("malformed_open");
-            return false;
-        };
-        let accept_body = OpenStateBody {
-            profile_id: open.profile_id,
-            max_datagram: open.max_datagram,
-            nonce: open.nonce,
-        }
-        .encode();
-        let _ = self.enqueue_association_control(ControlType::Accept, accept_body);
-        self.accept_valid_datagram(
-            now,
-            authenticated,
-            boundary_len,
-            packet,
-            header,
-            control,
-            None,
-        );
-        true
-    }
-
-    fn receive_accept(
-        &mut self,
-        now: MonoNs,
-        authenticated: bool,
-        boundary_len: usize,
-        parsed: (PacketHandle, WireHeader, Option<ControlMessage>),
-    ) -> bool {
-        if self.config.role != Role::Initiator || parsed.1.epoch != self.epoch {
-            self.record_drop("invalid_accept");
-            return false;
-        }
-        let Some(body) = parsed
-            .2
-            .as_ref()
-            .and_then(|message| OpenStateBody::decode(&message.body))
-        else {
-            self.record_drop("malformed_accept");
-            return false;
-        };
-        if body.profile_id != UDP_LI_PROFILE_ID
-            || Some(body.nonce) != self.open_state.map(|open| open.nonce)
-        {
-            self.record_drop("accept_profile_mismatch");
-            return false;
-        }
-        let ctrl_seq = parsed
-            .2
-            .as_ref()
-            .expect("Accept branch has a control message")
-            .link_seq()
-            .expect("Accept has a link sequence");
-        let disposition = self.control_replay.inspect(ctrl_seq);
-        if disposition != ControlSeqDisposition::Accepted {
-            return self.handle_rejected_control(
-                now,
-                authenticated,
-                boundary_len,
-                parsed.0,
-                parsed.1,
-                disposition,
-            );
-        }
-        if self.association != AssociationState::Handshaking {
-            self.record_drop("invalid_accept");
-            return false;
-        }
-        let disposition = self.accept_control_seq(ctrl_seq);
-        if disposition != ControlSeqDisposition::Accepted {
-            return self.handle_rejected_control(
-                now,
-                authenticated,
-                boundary_len,
-                parsed.0,
-                parsed.1,
-                disposition,
-            );
-        }
-        self.association = AssociationState::Established;
-        self.accept_valid_datagram(
-            now,
-            authenticated,
-            boundary_len,
-            parsed.0,
-            parsed.1,
-            parsed.2,
-            None,
-        );
-        true
-    }
-
     fn accept_valid_datagram(
         &mut self,
         now: MonoNs,
@@ -1770,11 +1325,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             }
         }
 
-        if control.as_ref().is_some_and(|control| {
-            matches!(control.ctrl_type, ControlType::Open | ControlType::Accept)
-        }) {
-            return;
-        }
         self.received.push_back(ReceivedDatagram {
             recv_ts: now,
             boundary_len,
@@ -1783,36 +1333,6 @@ impl<T: DatagramTransport> UdpLiEndpoint<T> {
             header,
             control,
         });
-    }
-
-    fn handle_rejected_control(
-        &mut self,
-        now: MonoNs,
-        authenticated: bool,
-        boundary_len: usize,
-        packet: PacketHandle,
-        header: WireHeader,
-        disposition: ControlSeqDisposition,
-    ) -> bool {
-        if header.payload_len == 0 {
-            let reason = match disposition {
-                ControlSeqDisposition::Duplicate => "replayed_control",
-                ControlSeqDisposition::TooOld => "old_control",
-                ControlSeqDisposition::Accepted => {
-                    unreachable!("accepted control reached rejection handler")
-                }
-            };
-            self.record_drop(reason);
-            return false;
-        }
-        // First-copy-wins applies only to the control effect. Piggybacked user
-        // data remains independent and is still delivered exactly as before.
-        self.accept_valid_datagram(now, authenticated, boundary_len, packet, header, None, None);
-        true
-    }
-
-    fn accept_control_seq(&mut self, ctrl_seq: u32) -> ControlSeqDisposition {
-        self.control_replay.accept(ctrl_seq)
     }
 
     fn control_admissible(
@@ -1861,7 +1381,7 @@ fn qos_class(class: SendClass) -> QosClass {
     match class {
         SendClass::FileData => QosClass::Bulk,
         SendClass::Feedback => QosClass::Feedback,
-        SendClass::Association | SendClass::LinkControl => QosClass::Control,
+        SendClass::LinkControl => QosClass::Control,
     }
 }
 
@@ -1873,6 +1393,16 @@ fn write_transmit_fields(header: &mut conet_core::HeaderBuf, link_seq: u32) {
     bytes[4..8].copy_from_slice(&link_seq.to_be_bytes());
 }
 
+fn is_transient_send_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+    )
+}
+
 fn encoded_entry_len(
     packet: &PacketHandle,
     class: SendClass,
@@ -1880,7 +1410,7 @@ fn encoded_entry_len(
     attached: Option<(&PacketHandle, Option<ControlSpec>)>,
     cc_bytes: Option<&[u8]>,
 ) -> usize {
-    let body_len = if matches!(class, SendClass::Association | SendClass::LinkControl) {
+    let body_len = if class == SendClass::LinkControl {
         0
     } else {
         packet.payload_bytes().len()
@@ -1922,7 +1452,7 @@ fn encode_entry_into(
     cc_bytes: Option<OpaqueBytes>,
     bytes: &mut Vec<u8>,
 ) -> Result<(), WireError> {
-    let body = if class == SendClass::Association || class == SendClass::LinkControl {
+    let body = if class == SendClass::LinkControl {
         &[][..]
     } else {
         packet.payload_bytes()
@@ -1956,9 +1486,6 @@ fn encode_entry_into(
 
 fn write_control_prefix(bytes: &mut Vec<u8>, spec: ControlSpec) {
     bytes.push(spec.ctrl_type().wire_value());
-    if let ControlSpec::Link { ctrl_seq, .. } = spec {
-        bytes.extend_from_slice(&ctrl_seq.to_be_bytes());
-    }
 }
 
 fn bytes_packet(bytes: OpaqueBytes, headroom: usize) -> PacketHandle {
@@ -1973,10 +1500,6 @@ fn earliest(left: Option<MonoNs>, right: Option<MonoNs>) -> Option<MonoNs> {
     }
 }
 
-fn nonce_from_id(id: u32) -> u64 {
-    0x554c_4900_0000_0000 | u64::from(id)
-}
-
 /// Convert a plain user payload into an owned handle without interpreting it.
 pub fn payload_packet(payload: impl AsRef<[u8]>) -> PacketHandle {
     bytes_packet(
@@ -1988,37 +1511,11 @@ pub fn payload_packet(payload: impl AsRef<[u8]>) -> PacketHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Role, SimNetwork, SimTransport};
+    use crate::{Role, SimNetwork};
     use conet_core::{BlockId, Feedback};
 
-    fn enqueue_stale_profile_items(endpoint: &mut UdpLiEndpoint<SimTransport>) {
-        let mut file = bytes_packet(OpaqueBytes::from_static(b"stale-file"), WIRE_HEADER_LEN);
-        endpoint.initialize_header(&mut file, QosClass::Bulk, Some(10));
-        endpoint.file_queue.enqueue(file, None).unwrap();
-
-        let mut feedback = bytes_packet(
-            conet_core::encode_reliability_feedback(Feedback::ack(BlockId::new(9))).into(),
-            WIRE_HEADER_LEN,
-        );
-        let feedback_len = feedback.len();
-        endpoint.initialize_header(&mut feedback, QosClass::Feedback, Some(feedback_len));
-        endpoint.feedback_queue.enqueue(feedback, None).unwrap();
-
-        let mut control = bytes_packet(OpaqueBytes::from_static(b"stale-control"), WIRE_HEADER_LEN);
-        endpoint.initialize_header(&mut control, QosClass::Control, Some(0));
-        endpoint
-            .link_control_queue
-            .enqueue(
-                control,
-                Some(ControlSpec::Cc {
-                    ctrl_type: ControlType::CcOpaque,
-                }),
-            )
-            .unwrap();
-    }
-
     #[test]
-    fn close_and_fresh_start_cancel_leftover_profile_queues() {
+    fn local_close_and_reset_cancel_queues_without_setup_packets() {
         let network = SimNetwork::new();
         let old_id = 0x91_c0_ffee;
         let old_epoch = 7;
@@ -2026,7 +1523,8 @@ mod tests {
             network.transport(0),
             EndpointConfig::new(Role::Initiator, u64::MAX),
         );
-        endpoint.establish_for_test(old_id, old_epoch).unwrap();
+        endpoint.association_id = Some(old_id);
+        endpoint.epoch = old_epoch;
         endpoint
             .enqueue_file_data(payload_packet(b"queued-file"))
             .unwrap();
@@ -2043,69 +1541,36 @@ mod tests {
         assert_eq!(endpoint.queued(SendClass::Feedback), 0);
         assert_eq!(endpoint.queued(SendClass::LinkControl), 0);
         endpoint.drive(MonoNs::new(1_000_000));
-
-        let close_frames = network.frames_from(0);
-        assert_eq!(close_frames.len(), 1);
-        let close = ReferenceWireCodec::default()
-            .parse(OpaqueBytes::copy_from_slice(&close_frames[0].bytes))
-            .unwrap();
-        assert_eq!(close.header().flags.qos, QosClass::Control);
-        assert_eq!(close.packet().header().len(), 12);
-        assert_eq!(close.header().epoch, old_epoch);
-        assert!(close.packet().payload_bytes().is_empty());
-        assert_eq!(
-            close.control().map(|control| control.ctrl_type),
-            Some(ControlType::Close)
-        );
-
-        endpoint.association = AssociationState::Closed;
-        enqueue_stale_profile_items(&mut endpoint);
-        assert_eq!(endpoint.queued(SendClass::FileData), 1);
-        assert_eq!(endpoint.queued(SendClass::Feedback), 1);
-        assert_eq!(endpoint.queued(SendClass::LinkControl), 1);
-        endpoint.drive(MonoNs::ZERO);
-        assert_eq!(network.frames_from(0).len(), 1);
+        assert!(network.frames_from(0).is_empty());
 
         endpoint.start_association().unwrap();
         let new_id = endpoint.association_id().unwrap();
         assert_ne!(new_id, old_id);
-        assert_eq!(endpoint.cancelled_packets(), 6);
+        assert_eq!(endpoint.cancelled_packets(), 3);
         assert_eq!(endpoint.queued(SendClass::FileData), 0);
         assert_eq!(endpoint.queued(SendClass::Feedback), 0);
         assert_eq!(endpoint.queued(SendClass::LinkControl), 0);
         endpoint.drive(MonoNs::new(1_000_000));
         endpoint.drive(MonoNs::new(2_000_000));
-
-        let frames = network.frames_from(0);
-        assert_eq!(frames.len(), 2);
-        let open = ReferenceWireCodec::default()
-            .parse(OpaqueBytes::copy_from_slice(&frames[1].bytes))
-            .unwrap();
-        assert_eq!(open.header().flags.qos, QosClass::Control);
-        assert_eq!(open.packet().header().len(), 12);
-        assert_eq!(open.header().epoch, 1);
-        assert_eq!(
-            open.control().map(|control| control.ctrl_type),
-            Some(ControlType::Open)
-        );
+        assert_eq!(endpoint.state(), AssociationState::Ready);
+        assert_eq!(endpoint.epoch(), 1);
+        assert!(network.frames_from(0).is_empty());
     }
 
     #[test]
     fn encode_entry_into_matches_the_allocating_reference() {
         let packet = payload_packet(b"payload");
         let attached_packet = payload_packet(b"attached");
-        let attached_control = ControlSpec::Link {
-            ctrl_type: ControlType::Close,
-            ctrl_seq: 0x0102_0304,
+        let attached_control = ControlSpec::Cc {
+            ctrl_type: ControlType::CcOpaque,
         };
 
         let cases = [
             (SendClass::FileData, None, None, None),
             (
                 SendClass::Feedback,
-                Some(ControlSpec::Link {
-                    ctrl_type: ControlType::Accept,
-                    ctrl_seq: 7,
+                Some(ControlSpec::Cc {
+                    ctrl_type: ControlType::CcOpaque,
                 }),
                 None,
                 None,

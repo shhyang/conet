@@ -8,34 +8,38 @@
 
 pub mod association;
 pub mod endpoint;
+pub mod keepalive;
 #[cfg(target_os = "linux")]
 mod linux;
+pub mod path_challenge;
+pub mod reflexive;
 pub mod scheduler;
 pub mod sim;
 pub mod transport;
 
-pub use association::{
-    ASSOCIATION_BODY_LEN, AssociationError, AssociationState, HandshakePolicy, OpenStateBody, Role,
-    UDP_LI_PROFILE_ID,
-};
+pub use association::{AssociationError, AssociationState, Role};
 pub use endpoint::{
-    DriveReport, EndpointConfig, EnqueueBeforeEstablished, ProfileEnqueueError,
-    ProfileEnqueueErrorKind, ReceivedDatagram, SentDatagram, UdpLiEndpoint, UdpLiEnqueueStatus,
-    payload_packet,
+    DriveReport, EndpointConfig, LocalSendOutcome, ProfileEnqueueError, ProfileEnqueueErrorKind,
+    ReceivedDatagram, SentDatagram, UdpLiEndpoint, UdpLiEnqueueStatus, payload_packet,
 };
 pub use scheduler::{ControlWindow, SchedulerConfig, SendClass, choose_class};
 pub use sim::{SimFrame, SimNetwork, SimTransport};
 #[cfg(target_os = "linux")]
 pub use transport::LinuxOffloadCapabilities;
-pub use transport::{
-    DatagramTransport, EcnCodepoint, InboundDatagram, LeasedWire, LoopbackError,
-    LoopbackUdpTransport, RecvMeta, WireBuf, WireBufPool, WireIoCounters, WireIoStats, WireLease,
+pub use keepalive::{
+    KEEPALIVE_MAGIC, KEEPALIVE_VERSION, KeepaliveConfig, KeepaliveError, KeepaliveStats,
+    PROPOSED_IDLE_AFTER, PROPOSED_INTERVAL,
 };
-
-/// OPEN/ACCEPT fields initialized at packetization and kept locally.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenState {
-    pub profile_id: u16,
-    pub max_datagram: u16,
-    pub nonce: u64,
-}
+pub use path_challenge::{
+    PATH_CHALLENGE_MAGIC, PATH_CHALLENGE_VERSION, PathChallengeError, PathChallengePoll,
+    PendingPathChallenge,
+};
+pub use reflexive::{
+    ReflexiveError, ReflexiveReport, REFLEXIVE_MAGIC, REFLEXIVE_VERSION, decode_response,
+    discover_reflexive, encode_request, encode_response, reflect_request, serve_reflexive_until,
+};
+pub use transport::{
+    ConnectedUdpTransport, DatagramTransport, EcnCodepoint, InboundDatagram, LeasedWire,
+    LoopbackError, LoopbackUdpTransport, PeerAdmitPolicy, PeerBindingState, PeerRejectStats,
+    RecvMeta, WireBuf, WireBufPool, WireIoCounters, WireIoStats, WireLease,
+};

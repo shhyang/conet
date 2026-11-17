@@ -1,6 +1,6 @@
 use conet_core::{
-    BackingAccounting, BidirectionalAck, BlockId, BlockStatus, Clock, FeedbackResponderConfig,
-    IdentityReceiver, InProcessLink, LinkEndpoint, LinkReceiver, MonoNs,
+    BackingAccounting, BidirectionalAck, BlockId, BlockStatus, Clock, FeedbackKind,
+    FeedbackResponderConfig, IdentityReceiver, InProcessLink, LinkEndpoint, LinkReceiver, MonoNs,
     PacketHandle, PacketMetrics, PacketQueue, PayloadCopyCounter, QueueLimits,
     ReliabilityResponder, ReliabilitySender, VirtualClock, paced_identity_link,
 };
@@ -84,6 +84,13 @@ impl Harness {
             .incoming_mut()
             .enqueue(pkt)
             .expect("A reverse queue has capacity");
+    }
+
+    fn inject_bad_reverse_data(&mut self, pkt: PacketHandle) {
+        self.b
+            .incoming_mut()
+            .enqueue(pkt)
+            .expect("B receive queue has capacity");
     }
 }
 
@@ -212,3 +219,129 @@ fn t5_m5_raptor10_ack_drains_unsent_once_and_preserves_in_flight() {
     assert_eq!(sender.status(BLOCK), Some(BlockStatus::Delivered));
 }
 
+#[test]
+fn t6_raptor10_lost_ack_repeats_and_all_acks_dropped_ends_without_ack() {
+    let mut harness = Harness::new();
+    let (mut sender, _) = make_sender(BidirectionalAck::new(12, ms(2_000)), 8);
+    let mut responder = make_responder(success_config());
+    let (recovery_at, _first_ack) =
+        send_until_recovered(&mut harness, &mut sender, &mut responder, MonoNs::ZERO);
+    let repeat_at = recovery_at.saturating_add(ms(50));
+    assert_eq!(
+        responder
+            .pump(&mut harness.b, repeat_at, 0, 16)
+            .acks_generated,
+        1
+    );
+    let mut repeat = harness.move_reverse(repeat_at);
+    assert_eq!(repeat.len(), 1);
+    harness.inject_feedback(repeat.pop().unwrap());
+    assert_eq!(
+        sender
+            .pump_bidirectional(&mut harness.a, repeat_at, 0, 0)
+            .acked,
+        1
+    );
+    assert_eq!(sender.status(BLOCK), Some(BlockStatus::Acked));
+
+    let mut harness = Harness::new();
+    let (mut sender, _) = make_sender(BidirectionalAck::new(6, ms(2_000)), 6);
+    let mut responder = make_responder(success_config());
+    let mut now = MonoNs::ZERO;
+    for step in 0..4 {
+        now = ms(step * 10);
+        sender.pump_bidirectional(&mut harness.a, now, 0, 1);
+        harness.move_forward(now);
+        responder.pump(&mut harness.b, now, 16, 16);
+        let _ = harness.move_reverse(now);
+    }
+    assert!(responder.is_recovered(BLOCK));
+    let linger = sender.stage(now.saturating_add(ms(1)), 4);
+    assert_eq!(linger.cancelled, 2);
+    assert_eq!(sender.status(BLOCK), Some(BlockStatus::LingerWithoutAck));
+    sender.stage(now.saturating_add(ms(2_001)), 4);
+    assert_eq!(sender.status(BLOCK), Some(BlockStatus::StoppedWithoutAck));
+}
+
+#[test]
+fn t7_duplicate_raptor10_ack_does_not_double_cancel_or_reopen() {
+    let mut harness = Harness::new();
+    let (mut sender, _) = make_sender(BidirectionalAck::new(12, ms(2_000)), 8);
+    let mut responder = make_responder(FeedbackResponderConfig {
+        ack_repeats: 2,
+        ..success_config()
+    });
+    let (recovery_at, mut feedback) =
+        send_until_recovered(&mut harness, &mut sender, &mut responder, MonoNs::ZERO);
+    harness.inject_feedback(feedback.pop().unwrap());
+    assert_eq!(
+        sender
+            .pump_bidirectional(&mut harness.a, recovery_at, 0, 0)
+            .cancelled,
+        4
+    );
+    assert_eq!(sender.take_cancelled().len(), 4);
+
+    let duplicate_at = recovery_at.saturating_add(ms(50));
+    responder.pump(&mut harness.b, duplicate_at, 0, 16);
+    let mut duplicate = harness.move_reverse(duplicate_at);
+    harness.inject_feedback(duplicate.pop().unwrap());
+    let second = sender.pump_bidirectional(&mut harness.a, duplicate_at, 8, 8);
+    assert_eq!(second.duplicate_acks, 1);
+    assert_eq!(second.cancelled, 0);
+    assert_eq!(second.generated, 0);
+    assert_eq!(sender.status(BLOCK), Some(BlockStatus::Acked));
+}
+
+#[test]
+fn t18_raptor10_nack_continues_and_never_creates_ack_of_ack() {
+    let mut harness = Harness::new();
+    let (mut sender, _) = make_sender(BidirectionalAck::new(12, ms(2_000)), 8);
+    let mut responder = make_responder(FeedbackResponderConfig {
+        ack_repeats: 1,
+        ack_interval: ms(50),
+        nack_interval: Some(ms(100)),
+        requested_additional: 2,
+    });
+
+    sender.pump_bidirectional(&mut harness.a, MonoNs::ZERO, 0, 1);
+    harness.move_forward(MonoNs::ZERO);
+    responder.pump(&mut harness.b, MonoNs::ZERO, 16, 16);
+    let mut reverse = harness.move_reverse(MonoNs::ZERO);
+    let nack = reverse.pop().unwrap();
+    let stale_nack = nack.fanout();
+    harness.inject_feedback(nack);
+    let nack_report = sender.receive_feedback(harness.a.incoming(), ms(1), 16);
+    assert_eq!(nack_report.nacked, 1);
+    assert_eq!(nack_report.last_feedback.unwrap().kind, FeedbackKind::Nack);
+    assert_eq!(sender.status(BLOCK), Some(BlockStatus::Sending));
+
+    let mut now = MonoNs::ZERO;
+    for step in 1..4 {
+        now = ms(step * 10);
+        sender.pump_bidirectional(&mut harness.a, now, 0, 1);
+        harness.move_forward(now);
+        responder.pump(&mut harness.b, now, 16, 16);
+    }
+    assert!(responder.is_recovered(BLOCK));
+    let mut ack = harness.move_reverse(now);
+    let ack_packet = ack.pop().unwrap();
+    let ack_copy = ack_packet.fanout();
+    harness.inject_feedback(ack_packet);
+    assert_eq!(
+        sender.receive_feedback(harness.a.incoming(), now, 16).acked,
+        1
+    );
+
+    harness.inject_feedback(stale_nack);
+    assert_eq!(
+        sender
+            .receive_feedback(harness.a.incoming(), now, 16)
+            .nacked,
+        0
+    );
+    harness.inject_bad_reverse_data(ack_copy);
+    let no_nested = responder.pump(&mut harness.b, now, 16, 0);
+    assert_eq!(no_nested.ignored, 1);
+    assert_eq!(no_nested.acks_generated, 0);
+}

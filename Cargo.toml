@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = ["Shenghao Yang <shenghao.yang@gmail.com>"]
@@ -22,10 +22,10 @@ keywords = ["networking", "udp", "fountain", "congestion-control"]
 categories = ["network-programming"]
 
 [workspace.dependencies]
-conet_core = { path = "crates/conet_core", version = "0.1.0" }
-conet_cc = { path = "crates/conet_cc", version = "0.1.0" }
-conet_fountain = { path = "crates/conet_fountain", version = "0.1.0" }
-conet_udp = { path = "crates/conet_udp", version = "0.1.0" }
-conet_transfer = { path = "crates/conet_transfer", version = "0.1.0" }
-conet_mux = { path = "crates/conet_mux", version = "0.1.0" }
-conet_sim = { path = "crates/conet_sim", version = "0.1.0" }
+conet_core = { path = "crates/conet_core", version = "0.1.1" }
+conet_cc = { path = "crates/conet_cc", version = "0.1.1" }
+conet_fountain = { path = "crates/conet_fountain", version = "0.1.1" }
+conet_udp = { path = "crates/conet_udp", version = "0.1.1" }
+conet_transfer = { path = "crates/conet_transfer", version = "0.1.1" }
+conet_mux = { path = "crates/conet_mux", version = "0.1.1" }
+conet_sim = { path = "crates/conet_sim", version = "0.1.1" }

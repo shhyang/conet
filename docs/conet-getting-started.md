@@ -10,9 +10,10 @@ rely on it.
 # Conet getting started
 
 This guide covers the Conet crates: how to build them, what they do, and short
-examples.
+examples. For layering and how paths are formed, see
+[`conet-design-overview.md`](conet-design-overview.md).
 
-**Version target:** workspace `0.1.0` (research MVP; APIs may change).
+**Version target:** workspace `0.1.1` (research MVP; APIs may change).
 Software: AGPL-3.0-only (see root `LICENSE`). Doc terms: notice above.
 
 ---
@@ -50,6 +51,12 @@ cargo run -p conet_transfer -- --help
 ```
 
 ---
+
+## Two-host LAN and public↔NAT
+
+Operator details for `send` / `recv`, open-loop vs closed-loop, and the
+retained NAT path (NAT sends first; public host learns the observed source)
+are in [user/conet-transfer.md](user/conet-transfer.md).
 
 ## Quick start: file transfer CLI
 
@@ -284,13 +291,9 @@ when you want a bottleneck model under core link traits; see
 
 ## Where to look next
 
-| Task | Place |
-| --- | --- |
-| CLI flags | `crates/conet_transfer/src/main.rs` |
-| Transfer API | `crates/conet_transfer/src/lib.rs` |
-| UDP-LI endpoint | `crates/conet_udp/src/endpoint.rs` |
-| CUBIC / BBR / ACK feedback | `crates/conet_cc/src/{cubic,bbr,feedback}.rs` |
-| Controller traits | `crates/conet_core/src/control.rs` |
-| Mux examples | `crates/conet_mux/tests/s12_mux.rs` |
+- Design / layering / how paths form → [`conet-design-overview.md`](conet-design-overview.md)
+- Two-host / NAT transfer → [`user/conet-transfer.md`](user/conet-transfer.md)
+- CLI flags → `crates/conet_transfer/src/main.rs`
+- Transfer API → `crates/conet_transfer/src/lib.rs`
 
 Commercial licensing: see `COMMERCIAL-LICENSE.md` / contact in `NOTICE`.

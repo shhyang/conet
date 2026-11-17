@@ -1,4 +1,7 @@
-use conet_cc::{AckReceiver, BbrController, MonoNs, RxController, TxController};
+use conet_cc::{
+    AckReceiver, BbrController, FeedbackMessage, MonoNs, OpaqueBytes, RxController, TxController,
+};
+use conet_core::ReferenceWireCodec;
 use conet_udp::{
     EndpointConfig, Role, SendClass, SimNetwork, SimTransport, UdpLiEndpoint, payload_packet,
 };
@@ -42,8 +45,6 @@ fn bbr_endpoint_enforces_its_cap_and_transfers_over_the_simulator() {
         Box::new(conet_core::FixedRateController::new(u64::MAX)),
         Some(Box::new(AckReceiver::new())),
     );
-    sender.establish_for_test(0xb0b0, 1).unwrap();
-    receiver.establish_for_test(0xb0b0, 1).unwrap();
     for value in 0..8_u8 {
         sender
             .enqueue_file_data(payload_packet([value; 500]))
@@ -69,3 +70,50 @@ fn bbr_endpoint_enforces_its_cap_and_transfers_over_the_simulator() {
     assert!(sender.controller_inflight_bytes().is_some());
 }
 
+#[test]
+fn would_blocked_ack_control_send_reuses_the_pending_private_identity() {
+    let network = SimNetwork::new();
+    network.set_authenticated(true);
+    let mut sender = endpoint(
+        &network,
+        0,
+        Role::Initiator,
+        Box::new(BbrController::new(MonoNs::ZERO)),
+        None,
+    );
+    let mut receiver = endpoint(
+        &network,
+        1,
+        Role::Responder,
+        Box::new(conet_core::FixedRateController::new(u64::MAX)),
+        Some(Box::new(AckReceiver::new())),
+    );
+    sender
+        .enqueue_file_data(payload_packet(b"bbr-feedback"))
+        .unwrap();
+
+    assert_eq!(sender.drive(MonoNs::ZERO).sent, 1);
+    receiver.drive(ms(1));
+    assert_eq!(receiver.queued(SendClass::LinkControl), 1);
+    network.fail_next_send(1);
+    let failed = receiver.drive(ms(2));
+    assert!(failed.send_would_block);
+    assert!(failed.send_failed);
+    assert_eq!(receiver.queued(SendClass::LinkControl), 1);
+
+    let retried = receiver.drive(ms(3));
+    assert_eq!(retried.sent, 1);
+    assert_eq!(receiver.queued(SendClass::LinkControl), 0);
+    let frames = network.frames_from(1);
+    assert_eq!(frames.len(), 1);
+    let parsed = ReferenceWireCodec::default()
+        .parse(OpaqueBytes::copy_from_slice(&frames[0].bytes))
+        .unwrap();
+    let feedback =
+        FeedbackMessage::decode(&parsed.control().expect("standalone feedback control").body)
+            .unwrap();
+    assert_eq!(feedback.control_id, Some(1));
+
+    sender.drive(ms(4));
+    assert_eq!(sender.controller_inflight_bytes(), Some(0));
+}

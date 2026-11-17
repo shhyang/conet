@@ -2,9 +2,9 @@
 //!
 //! This crate is deliberately independent of UDP, sockets, and application
 //! policy. It provides the deterministic harness, shared immutable payload
-//! handles, bounded queues, in-process identity links, reusable rate
-//! pacing/controller contracts, and a profile-local wire container without
-//! adding transport or typed controller bodies.
+//! handles, bounded queues, in-process identity links, and reusable rate
+//! pacing/controller contracts. The wire helpers add a profile-local container
+//! without adding transport or typed controller bodies.
 
 #![forbid(unsafe_code)]
 

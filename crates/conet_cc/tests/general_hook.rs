@@ -97,9 +97,6 @@ fn dummy_hook_uses_opaque_trailer_feedback_rate_and_window() {
     let trailer = OpaqueBytes::from_static(b"\x00not-a-residual-status\xff");
     let (mut sender, sender_arm, _) = endpoint(&network, 0, Role::Initiator, Some(trailer.clone()));
     let (mut receiver, _, receiver_evidence) = endpoint(&network, 1, Role::Responder, None);
-    sender.establish_for_test(0x4343, 1).unwrap();
-    receiver.establish_for_test(0x4343, 1).unwrap();
-
     sender
         .enqueue_file_data(payload_packet(b"format-agnostic-body"))
         .unwrap();

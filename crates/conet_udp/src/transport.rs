@@ -7,9 +7,19 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use conet_core::{MonoNs, OpaqueBytes};
+use conet_core::{MonoNs, OpaqueBytes, ReferenceWireCodec, WireLimits};
+
+use crate::keepalive::{
+    KeepaliveConfig, KeepaliveState, KeepaliveStats, decode_keepalive, is_keepalive_frame,
+    send_ping, send_pong, KEEPALIVE_TYPE_PING,
+};
+use crate::path_challenge::{
+    PathChallengeError, PathChallengePoll, PendingPathChallenge, is_path_challenge_frame,
+    match_response, maybe_retransmit, respond_to_challenge, start_challenge,
+};
+use crate::reflexive::{ReflexiveError, ReflexiveReport, discover_reflexive};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -301,6 +311,16 @@ impl WireBuf {
         self.len = len;
     }
 
+    /// Restore the full writable backing before the next `recv` into this buffer.
+    ///
+    /// [`Self::as_mut_slice`] exposes only the used prefix. After a short
+    /// control datagram shrinks that prefix, the next receive must widen it
+    /// again or later datagrams are silently truncated.
+    pub fn prepare_recv(&mut self) {
+        let capacity = self.storage_ref().len();
+        self.len = capacity;
+    }
+
     /// Freeze this buffer and retain an explicit lease over its backing.
     pub fn into_shared(mut self) -> LeasedWire {
         let storage = self
@@ -474,6 +494,33 @@ pub trait DatagramTransport {
     fn send_datagram(&mut self, now: MonoNs, bytes: &[u8]) -> io::Result<()>;
     fn recv_datagram(&mut self, now: MonoNs) -> io::Result<Option<InboundDatagram>>;
 
+    /// UL-4: emit idle keepalives if the concrete transport supports them.
+    ///
+    /// Returns the number of keepalive datagrams sent. The default is a no-op
+    /// so simulators and loopback adapters stay unchanged.
+    fn drive_keepalive(&mut self) -> io::Result<u32> {
+        Ok(0)
+    }
+
+    /// Enable or disable emission of transport controls (keepalive / challenge).
+    ///
+    /// Closed associations should disable emission so receive-side processing
+    /// cannot reply after [`crate::UdpLiEndpoint::close`]. Default is a no-op.
+    fn set_emit_controls(&mut self, _enabled: bool) {}
+
+    /// Clear in-flight path-challenge state on association restart.
+    ///
+    /// Validated peer bindings may survive; pending challenges must not.
+    /// Default is a no-op.
+    fn on_association_restart(&mut self) {}
+
+    /// Wall-clock delay until the next transport control action (keepalive or
+    /// challenge retransmit), if any. `Some(Duration::ZERO)` means due now.
+    /// Used by [`crate::UdpLiEndpoint::drive_when_ready_with_timeout`].
+    fn next_io_wake(&self) -> Option<Duration> {
+        None
+    }
+
     /// Wait for socket readability or the supplied timeout.
     ///
     /// `None` waits until readability. The default is a sleep-based permanent
@@ -587,6 +634,609 @@ impl fmt::Display for LoopbackError {
 }
 
 impl std::error::Error for LoopbackError {}
+
+/// Peer binding lifecycle for one UDP-LI association (UL-2).
+///
+/// Default shipping behavior stays fail-closed on IP mismatch. A lab
+/// `observe_ip` policy may accept the first Conet source IP when the
+/// configured peer was only a guess (WAN HTTP vs UDP egress split).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeerBindingState {
+    /// Only the configured destination is known.
+    #[default]
+    Configured,
+    /// A Conet source was seen but is not yet trusted for send.
+    Observed,
+    /// Path is trusted for send (auto-validate until UL-3, or explicit promote).
+    Validated,
+    /// Optional pin after validation; conflicting sources are rejected.
+    Locked,
+}
+
+/// Admission policy for [`ConnectedUdpTransport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerAdmitPolicy {
+    /// Allow the first admissible Conet datagram to rewrite the peer IP.
+    pub observe_ip: bool,
+    /// Promote `Observed` to `Validated` immediately (legacy NAT port learning).
+    pub auto_validate: bool,
+    /// After validation, pin the peer (`Locked`) so a second source is rejected.
+    pub lock_on_validate: bool,
+    /// When observing without `auto_validate`, immediately emit a UL-3 path challenge.
+    pub auto_challenge: bool,
+}
+
+impl Default for PeerAdmitPolicy {
+    fn default() -> Self {
+        Self {
+            observe_ip: false,
+            auto_validate: true,
+            lock_on_validate: true,
+            auto_challenge: false,
+        }
+    }
+}
+
+impl PeerAdmitPolicy {
+    /// Lab bridge for WAN probes where HTTP public IP may disagree with UDP egress.
+    pub const fn lab_observe_ip() -> Self {
+        Self {
+            observe_ip: true,
+            auto_validate: true,
+            lock_on_validate: true,
+            auto_challenge: false,
+        }
+    }
+
+    /// Shipping-shaped admit: observe then UL-3 challenge before trusted send.
+    pub const fn require_path_challenge() -> Self {
+        Self {
+            observe_ip: false,
+            auto_validate: false,
+            lock_on_validate: true,
+            auto_challenge: true,
+        }
+    }
+}
+
+/// Reject / filter counters for peer admission (observable on WAN silence).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerRejectStats {
+    pub wrong_ip: u64,
+    pub locked_conflict: u64,
+    pub non_conet: u64,
+    pub challenge_timeout: u64,
+    pub challenge_fail: u64,
+}
+
+/// Real UDP over one local/peer address pair.
+///
+/// Unlike [`LoopbackUdpTransport`], this adapter does not restrict either
+/// address family to loopback. The configured peer is the initial destination
+/// and, by default, an IP-address filter. The first admissible datagram may
+/// learn the observed source port (and, under [`PeerAdmitPolicy::observe_ip`],
+/// the source IP). Trusted send follows validation rules (UL-2).
+#[derive(Debug)]
+pub struct ConnectedUdpTransport {
+    socket: UdpSocket,
+    peer: SocketAddr,
+    learned_peer: Option<SocketAddr>,
+    binding: PeerBindingState,
+    policy: PeerAdmitPolicy,
+    rejects: PeerRejectStats,
+    pending_challenge: Option<PendingPathChallenge>,
+    keepalive: KeepaliveState,
+    /// When false, consume control frames without emitting replies or probes.
+    emit_controls: bool,
+    receive_pool: WireBufPool,
+    counters: WireIoCounters,
+}
+
+impl ConnectedUdpTransport {
+    pub fn bind(local: SocketAddr, peer: SocketAddr) -> io::Result<Self> {
+        let socket = UdpSocket::bind(local)?;
+        socket.set_nonblocking(true)?;
+        Self::with_socket(socket, peer, PeerAdmitPolicy::default())
+    }
+
+    /// Wrap an already-bound UDP socket for one explicit peer.
+    pub fn from_socket(socket: UdpSocket, peer: SocketAddr) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Self::with_socket(socket, peer, PeerAdmitPolicy::default())
+    }
+
+    /// Bind with an explicit peer-admission policy (UL-2 lab / shipping profiles).
+    pub fn bind_with_policy(
+        local: SocketAddr,
+        peer: SocketAddr,
+        policy: PeerAdmitPolicy,
+    ) -> io::Result<Self> {
+        let socket = UdpSocket::bind(local)?;
+        socket.set_nonblocking(true)?;
+        Self::with_socket(socket, peer, policy)
+    }
+
+    pub fn from_socket_with_policy(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        policy: PeerAdmitPolicy,
+    ) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Self::with_socket(socket, peer, policy)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub const fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// The observed peer endpoint after the first admissible datagram.
+    pub const fn learned_peer_addr(&self) -> Option<SocketAddr> {
+        self.learned_peer
+    }
+
+    pub const fn peer_binding_state(&self) -> PeerBindingState {
+        self.binding
+    }
+
+    pub const fn peer_admit_policy(&self) -> PeerAdmitPolicy {
+        self.policy
+    }
+
+    pub const fn peer_reject_stats(&self) -> PeerRejectStats {
+        self.rejects
+    }
+
+    /// Promote `Observed` → `Validated` (and optionally `Locked`).
+    ///
+    /// No-op success if already validated/locked. Fails if still `Configured`.
+    pub fn validate_observed_peer(&mut self) -> bool {
+        match self.binding {
+            PeerBindingState::Observed => {
+                self.promote_validated();
+                true
+            }
+            PeerBindingState::Validated | PeerBindingState::Locked => true,
+            PeerBindingState::Configured => false,
+        }
+    }
+
+    /// UL-6: discover this socket's reflexive address via a helper on the
+    /// **same** UDP socket used for the association.
+    ///
+    /// The result is a candidate only—it does not change peer binding or trust.
+    pub fn probe_reflexive(
+        &self,
+        helper: SocketAddr,
+        timeout: Duration,
+    ) -> Result<ReflexiveReport, ReflexiveError> {
+        discover_reflexive(&self.socket, helper, timeout)
+    }
+
+    /// Replace the keepalive policy (UL-4). Disabled by default.
+    pub fn set_keepalive_config(&mut self, config: KeepaliveConfig) {
+        let stats = self.keepalive.stats;
+        self.keepalive = KeepaliveState::new(config);
+        self.keepalive.stats = stats;
+    }
+
+    pub const fn keepalive_config(&self) -> KeepaliveConfig {
+        self.keepalive.config
+    }
+
+    pub const fn keepalive_stats(&self) -> KeepaliveStats {
+        self.keepalive.stats
+    }
+
+    /// In-flight path challenge, if any.
+    pub fn pending_path_challenge(&self) -> Option<&PendingPathChallenge> {
+        self.pending_challenge.as_ref()
+    }
+
+    /// UL-3: challenge `candidate` before trusting it for send.
+    ///
+    /// If the association is already locked to another peer, a successful
+    /// challenge replaces the learned peer. Fails if a challenge is already
+    /// in flight.
+    pub fn challenge_candidate(
+        &mut self,
+        candidate: SocketAddr,
+    ) -> Result<(), PathChallengeError> {
+        if self.pending_challenge.is_some() {
+            return Err(PathChallengeError::Busy);
+        }
+        self.pending_challenge = Some(start_challenge(
+            &self.socket,
+            candidate,
+            3,
+            Duration::from_millis(200),
+        )?);
+        Ok(())
+    }
+
+    /// Retransmit or time out the pending UL-3 challenge.
+    pub fn drive_path_challenge(&mut self) -> Result<PathChallengePoll, PathChallengeError> {
+        if !self.emit_controls {
+            return Ok(PathChallengePoll::Pending);
+        }
+        let Some(pending) = self.pending_challenge.as_mut() else {
+            return Ok(PathChallengePoll::Pending);
+        };
+        let poll = maybe_retransmit(&self.socket, pending, Instant::now())?;
+        match poll {
+            PathChallengePoll::TimedOut { candidate } => {
+                self.fail_challenge(candidate);
+                Ok(PathChallengePoll::TimedOut { candidate })
+            }
+            PathChallengePoll::Validated { candidate } => {
+                self.complete_challenge(candidate);
+                Ok(PathChallengePoll::Validated { candidate })
+            }
+            PathChallengePoll::Pending => Ok(PathChallengePoll::Pending),
+        }
+    }
+
+    /// Drop any in-flight challenge without changing a validated binding.
+    ///
+    /// Association restart must call this so a delayed response from a prior
+    /// epoch cannot promote a stale candidate onto the new epoch.
+    pub fn invalidate_pending_challenge(&mut self) {
+        self.pending_challenge = None;
+    }
+
+    /// Destination used for trusted send.
+    ///
+    /// Until the peer is validated, this stays on the configured address so an
+    /// unvalidated observe cannot redirect bulk traffic.
+    fn selected_peer(&self) -> SocketAddr {
+        match self.binding {
+            PeerBindingState::Validated | PeerBindingState::Locked => {
+                self.learned_peer.unwrap_or(self.peer)
+            }
+            PeerBindingState::Configured | PeerBindingState::Observed => self.peer,
+        }
+    }
+
+    fn promote_validated(&mut self) {
+        self.binding = if self.policy.lock_on_validate {
+            PeerBindingState::Locked
+        } else {
+            PeerBindingState::Validated
+        };
+    }
+
+    fn complete_challenge(&mut self, candidate: SocketAddr) {
+        self.learned_peer = Some(candidate);
+        self.pending_challenge = None;
+        self.promote_validated();
+        self.note_path_activity();
+    }
+
+    fn fail_challenge(&mut self, _candidate: SocketAddr) {
+        self.pending_challenge = None;
+        self.rejects.challenge_timeout = self.rejects.challenge_timeout.saturating_add(1);
+        // First-path challenge failure returns to Configured. A locked prior
+        // path is kept so remaps cannot steal the association without success.
+        if !matches!(
+            self.binding,
+            PeerBindingState::Validated | PeerBindingState::Locked
+        ) {
+            self.learned_peer = None;
+            self.binding = PeerBindingState::Configured;
+        }
+    }
+
+    fn launch_challenge(&mut self, candidate: SocketAddr) {
+        if self.pending_challenge.is_some() {
+            return;
+        }
+        match start_challenge(&self.socket, candidate, 3, Duration::from_millis(200)) {
+            Ok(pending) => self.pending_challenge = Some(pending),
+            Err(_) => {
+                self.rejects.challenge_fail = self.rejects.challenge_fail.saturating_add(1);
+            }
+        }
+    }
+
+    fn accept_source(&mut self, source: SocketAddr) -> bool {
+        if let Some(learned) = self.learned_peer {
+            if learned == source {
+                return true;
+            }
+            // Allow a challenge toward a new candidate while keeping the old path.
+            if self.pending_challenge.as_ref().is_some_and(|p| p.candidate == source) {
+                return false;
+            }
+            self.rejects.locked_conflict = self.rejects.locked_conflict.saturating_add(1);
+            return false;
+        }
+
+        if !self.policy.observe_ip && source.ip() != self.peer.ip() {
+            self.rejects.wrong_ip = self.rejects.wrong_ip.saturating_add(1);
+            return false;
+        }
+
+        self.learned_peer = Some(source);
+        self.binding = PeerBindingState::Observed;
+        if self.policy.auto_validate {
+            self.promote_validated();
+        } else if self.policy.auto_challenge {
+            self.launch_challenge(source);
+        }
+        true
+    }
+
+    fn handle_path_frame(&mut self, source: SocketAddr, bytes: &[u8]) -> bool {
+        if !self.emit_controls {
+            // Swallow CULP while closed / controls disabled; do not reply.
+            return true;
+        }
+        // Dispatch by control type first. An incoming challenge must be answered
+        // even while we await our own response; treating it as a response yields
+        // BadType and both peers can exhaust retries.
+        if respond_to_challenge(&self.socket, bytes, source).is_ok() {
+            return true;
+        }
+        let Some(pending) = self.pending_challenge.as_ref() else {
+            return false;
+        };
+        match match_response(pending, source, bytes) {
+            Ok(Some(PathChallengePoll::Validated { candidate })) => {
+                self.complete_challenge(candidate);
+                true
+            }
+            Ok(Some(PathChallengePoll::TimedOut { candidate })) => {
+                self.fail_challenge(candidate);
+                true
+            }
+            Ok(Some(PathChallengePoll::Pending)) | Ok(None) => false,
+            Err(_) => {
+                self.rejects.challenge_fail = self.rejects.challenge_fail.saturating_add(1);
+                true
+            }
+        }
+    }
+
+    fn is_admitted_keepalive_source(&self, source: SocketAddr) -> bool {
+        match self.learned_peer {
+            Some(learned) => learned == source,
+            None => self.policy.observe_ip || source.ip() == self.peer.ip(),
+        }
+    }
+
+    fn trusted_send_peer(&self) -> Option<SocketAddr> {
+        match self.binding {
+            PeerBindingState::Validated | PeerBindingState::Locked => {
+                Some(self.learned_peer.unwrap_or(self.peer))
+            }
+            PeerBindingState::Configured | PeerBindingState::Observed => None,
+        }
+    }
+
+    fn note_path_activity(&mut self) {
+        self.keepalive.note_activity();
+    }
+
+    fn handle_keepalive_frame(&mut self, source: SocketAddr, bytes: &[u8]) -> bool {
+        if !self.is_admitted_keepalive_source(source) {
+            self.rejects.wrong_ip = self.rejects.wrong_ip.saturating_add(1);
+            return true;
+        }
+        if !self.emit_controls || !self.keepalive.config.enabled {
+            // Admitted but disabled / closed: consume without activity or pong.
+            return true;
+        }
+        match decode_keepalive(bytes) {
+            Ok(KEEPALIVE_TYPE_PING) => {
+                self.keepalive.mark_received();
+                if send_pong(&self.socket, source).is_ok() {
+                    self.keepalive.mark_pong_sent();
+                }
+                true
+            }
+            Ok(_) => {
+                self.keepalive.mark_received();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn with_socket(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        policy: PeerAdmitPolicy,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            socket,
+            peer,
+            learned_peer: None,
+            binding: PeerBindingState::Configured,
+            policy,
+            rejects: PeerRejectStats::default(),
+            pending_challenge: None,
+            keepalive: KeepaliveState::new(KeepaliveConfig::default()),
+            emit_controls: true,
+            receive_pool: WireBufPool::new(32, 65_535),
+            counters: WireIoCounters::default(),
+        })
+    }
+}
+
+impl DatagramTransport for ConnectedUdpTransport {
+    fn send_datagram(&mut self, _now: MonoNs, bytes: &[u8]) -> io::Result<()> {
+        self.counters.record_syscall();
+        match self.socket.send_to(bytes, self.selected_peer()) {
+            Ok(sent) if sent == bytes.len() => {
+                self.note_path_activity();
+                Ok(())
+            }
+            Ok(sent) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("UDP send wrote {sent} of {} bytes", bytes.len()),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn set_emit_controls(&mut self, enabled: bool) {
+        self.emit_controls = enabled;
+    }
+
+    fn on_association_restart(&mut self) {
+        // Validated / locked bindings survive restart; pending challenges do not.
+        self.invalidate_pending_challenge();
+    }
+
+    fn next_io_wake(&self) -> Option<Duration> {
+        if !self.emit_controls {
+            return None;
+        }
+        let now = Instant::now();
+        let mut wake = self.keepalive.next_due_in(now);
+        if self.pending_challenge.is_some() {
+            let challenge = self
+                .pending_challenge
+                .as_ref()
+                .map(|pending| pending.next_retransmit_in(now))
+                .unwrap_or(Duration::ZERO);
+            wake = Some(wake.map_or(challenge, |wait| wait.min(challenge)));
+        }
+        wake
+    }
+
+    fn drive_keepalive(&mut self) -> io::Result<u32> {
+        if !self.emit_controls {
+            return Ok(0);
+        }
+        let now = Instant::now();
+        if !self.keepalive.should_send(now) {
+            return Ok(0);
+        }
+        let Some(peer) = self.trusted_send_peer() else {
+            return Ok(0);
+        };
+        self.counters.record_syscall();
+        match send_ping(&self.socket, peer) {
+            Ok(()) => {
+                self.keepalive.mark_sent(now);
+                Ok(1)
+            }
+            Err(error) => Err(io::Error::other(error.to_string())),
+        }
+    }
+
+    fn recv_datagram(&mut self, _now: MonoNs) -> io::Result<Option<InboundDatagram>> {
+        let _ = self.drive_path_challenge();
+        let _ = self.drive_keepalive();
+        let mut bytes = self
+            .receive_pool
+            .checkout(self.receive_pool.buffer_size())?;
+        loop {
+            // Short control frames shrink the used prefix; restore full capacity
+            // before every recv so the next datagram is not truncated.
+            bytes.prepare_recv();
+            self.counters.record_syscall();
+            match self.socket.recv_from(bytes.as_mut_slice()) {
+                Ok((len, source)) => {
+                    bytes.set_len(len);
+                    if is_path_challenge_frame(bytes.as_slice()) {
+                        let _ = self.handle_path_frame(source, bytes.as_slice());
+                        continue;
+                    }
+                    if is_keepalive_frame(bytes.as_slice()) {
+                        let _ = self.handle_keepalive_frame(source, bytes.as_slice());
+                        continue;
+                    }
+                    if !is_parseable_conet_datagram(bytes.as_slice()) {
+                        self.rejects.non_conet = self.rejects.non_conet.saturating_add(1);
+                        continue;
+                    }
+                    if !self.accept_source(source) {
+                        continue;
+                    }
+                    self.note_path_activity();
+                    return Ok(Some(InboundDatagram {
+                        bytes,
+                        // Address filtering does not provide a MAC. Security
+                        // profiles remain outside this transport slice.
+                        authenticated: false,
+                        meta: RecvMeta::new(len, Some(source)),
+                    }));
+                }
+                Err(error) if is_retryable_udp_io(error.kind()) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_readable(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
+            self.counters.record_syscall();
+            return match self.socket.peek_from(&mut [0_u8; 1]) {
+                Ok(_) => Ok(true),
+                Err(error) if is_retryable_udp_io(error.kind()) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+
+        self.socket.set_nonblocking(false)?;
+        let mut byte = [0_u8; 1];
+        let ready = self.socket.set_read_timeout(timeout).and_then(|()| {
+            self.counters.record_syscall();
+            self.socket
+                .peek_from(&mut byte)
+                .map(|_| true)
+                .or_else(|error| {
+                    if is_retryable_udp_io(error.kind()) {
+                        Ok(false)
+                    } else {
+                        Err(error)
+                    }
+                })
+        });
+
+        let timeout_cleared = self.socket.set_read_timeout(None);
+        let nonblocking = self.socket.set_nonblocking(true);
+        if nonblocking.is_err() {
+            let _ = self.socket.set_read_timeout(Some(Duration::ZERO));
+        }
+        if timeout_cleared.is_err() {
+            let _ = self.socket.set_read_timeout(Some(Duration::ZERO));
+        }
+        nonblocking?;
+        timeout_cleared?;
+        ready
+    }
+
+    fn io_stats(&self) -> WireIoStats {
+        self.counters.snapshot().merge(self.receive_pool.stats())
+    }
+}
+
+fn is_parseable_conet_datagram(bytes: &[u8]) -> bool {
+    let codec = ReferenceWireCodec::new(WireLimits {
+        max_datagram: u16::MAX as usize,
+        max_control_body: u16::MAX as usize,
+    });
+    codec.parse(OpaqueBytes::copy_from_slice(bytes)).is_ok()
+}
+
+fn is_retryable_udp_io(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+    )
+}
 
 /// Real UDP on loopback only, for gated conformance runs.
 ///
@@ -1183,6 +1833,23 @@ mod tests {
 
     use super::*;
 
+    fn conet_datagram(payload: &[u8]) -> Vec<u8> {
+        let codec = ReferenceWireCodec::default();
+        let datagram = codec
+            .build(
+                conet_core::WireHeader {
+                    flags: conet_core::WireFlags::default(),
+                    epoch: 1,
+                    link_seq: 10,
+                    payload_len: 0,
+                },
+                OpaqueBytes::copy_from_slice(payload),
+                None,
+            )
+            .unwrap();
+        codec.serialize(&datagram).unwrap()
+    }
+
     #[derive(Debug, Default)]
     struct ScalarTransport {
         sent: Vec<Vec<u8>>,
@@ -1209,6 +1876,26 @@ mod tests {
 
         fn recv_datagram(&mut self, _now: MonoNs) -> io::Result<Option<InboundDatagram>> {
             Ok(self.inbound.pop_front())
+        }
+    }
+
+    fn recv_connected(
+        transport: &mut ConnectedUdpTransport,
+        timeout: Duration,
+    ) -> Option<InboundDatagram> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(datagram) = transport.recv_datagram(MonoNs::ZERO).unwrap() {
+                return Some(datagram);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            transport
+                .wait_readable(Some(remaining.min(Duration::from_millis(25))))
+                .unwrap();
         }
     }
 
@@ -1457,6 +2144,204 @@ mod tests {
             .unwrap()
             .expect("readable datagram");
         assert_eq!(datagram.bytes.as_slice(), b"ready");
+    }
+
+    #[test]
+    fn connected_udp_accepts_non_loopback_peer_but_loopback_adapter_refuses_it() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let non_loopback_peer: SocketAddr = "192.0.2.1:7878".parse().unwrap();
+        let transport = ConnectedUdpTransport::from_socket(socket, non_loopback_peer).unwrap();
+        assert_eq!(transport.peer_addr(), non_loopback_peer);
+        assert!(!transport.peer_addr().ip().is_loopback());
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(LoopbackUdpTransport::from_socket(socket, non_loopback_peer).is_err());
+    }
+
+    #[test]
+    fn connected_udp_learns_nat_mapped_source_and_replies_to_it() {
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = sender_socket.local_addr().unwrap();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        // Hold this port so the receiver's configured source is definitely
+        // different from the sender's observed source.
+        let wrong_source = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let configured_source =
+            SocketAddr::new(sender_addr.ip(), wrong_source.local_addr().unwrap().port());
+
+        let mut sender = ConnectedUdpTransport::from_socket(sender_socket, receiver_addr).unwrap();
+        let mut receiver =
+            ConnectedUdpTransport::from_socket(receiver_socket, configured_source).unwrap();
+
+        wrong_source.send_to(b"not-conet", receiver_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            receiver
+                .recv_datagram(MonoNs::ZERO)
+                .expect("non-Conet is not fatal")
+                .is_none()
+        );
+        assert_eq!(receiver.learned_peer_addr(), None);
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Configured);
+        assert_eq!(receiver.peer_reject_stats().non_conet, 1);
+        let request_bytes = conet_datagram(b"request");
+        sender.send_datagram(MonoNs::ZERO, &request_bytes).unwrap();
+        let request =
+            recv_connected(&mut receiver, Duration::from_secs(1)).expect("NAT-mapped request");
+        assert_eq!(request.bytes.as_slice(), request_bytes);
+        assert_eq!(request.meta.source, Some(sender_addr));
+        assert_eq!(receiver.learned_peer_addr(), Some(sender_addr));
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Locked);
+
+        let reply_bytes = conet_datagram(b"reply");
+        receiver.send_datagram(MonoNs::ZERO, &reply_bytes).unwrap();
+        let reply =
+            recv_connected(&mut sender, Duration::from_secs(1)).expect("reply to observed source");
+        assert_eq!(reply.bytes.as_slice(), reply_bytes);
+        assert_eq!(reply.meta.source, Some(receiver_addr));
+        assert_eq!(sender.learned_peer_addr(), Some(receiver_addr));
+    }
+
+    #[test]
+    fn connected_udp_counts_wrong_ip_and_stays_configured() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        // Configure a different loopback-mapped IP filter that will not match
+        // 127.0.0.1 — use an alternate 127.0.0.0/8 address when available via
+        // binding, otherwise skip-style assert on reject counter alone.
+        let mut receiver = ConnectedUdpTransport::from_socket(
+            receiver_socket,
+            "127.0.0.2:9".parse().unwrap(),
+        )
+        .unwrap();
+
+        sender
+            .send_to(&conet_datagram(b"wan-mismatch"), receiver_addr)
+            .unwrap();
+        assert!(
+            recv_connected(&mut receiver, Duration::from_millis(200)).is_none(),
+            "wrong configured IP must not deliver"
+        );
+        assert_eq!(receiver.learned_peer_addr(), None);
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Configured);
+        assert!(receiver.peer_reject_stats().wrong_ip >= 1);
+        let _ = sender_addr;
+    }
+
+    #[test]
+    fn lab_observe_ip_accepts_first_conet_source_despite_wrong_configured_ip() {
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = sender_socket.local_addr().unwrap();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let mut sender = ConnectedUdpTransport::from_socket(sender_socket, receiver_addr).unwrap();
+        let mut receiver = ConnectedUdpTransport::from_socket_with_policy(
+            receiver_socket,
+            "127.0.0.2:9".parse().unwrap(),
+            PeerAdmitPolicy::lab_observe_ip(),
+        )
+        .unwrap();
+
+        let request_bytes = conet_datagram(b"observed-ip");
+        sender.send_datagram(MonoNs::ZERO, &request_bytes).unwrap();
+        let request =
+            recv_connected(&mut receiver, Duration::from_secs(1)).expect("observe_ip accepts");
+        assert_eq!(request.bytes.as_slice(), request_bytes);
+        assert_eq!(receiver.learned_peer_addr(), Some(sender_addr));
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Locked);
+        assert_eq!(receiver.peer_reject_stats().wrong_ip, 0);
+
+        let reply_bytes = conet_datagram(b"reply-observed");
+        receiver.send_datagram(MonoNs::ZERO, &reply_bytes).unwrap();
+        let reply = recv_connected(&mut sender, Duration::from_secs(1)).expect("reply to learned");
+        assert_eq!(reply.bytes.as_slice(), reply_bytes);
+    }
+
+    #[test]
+    fn observed_peer_does_not_redirect_send_until_validated() {
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = sender_socket.local_addr().unwrap();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let policy = PeerAdmitPolicy {
+            observe_ip: false,
+            auto_validate: false,
+            lock_on_validate: false,
+            auto_challenge: false,
+        };
+        let mut receiver =
+            ConnectedUdpTransport::from_socket_with_policy(receiver_socket, sender_addr, policy)
+                .unwrap();
+
+        sender_socket
+            .send_to(&conet_datagram(b"observe-only"), receiver_addr)
+            .unwrap();
+        let _ = recv_connected(&mut receiver, Duration::from_secs(1)).expect("observed");
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Observed);
+        assert_eq!(receiver.learned_peer_addr(), Some(sender_addr));
+        // Trusted send stays on the configured peer until explicit validate.
+        assert!(receiver.validate_observed_peer());
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Validated);
+    }
+
+    #[test]
+    fn connected_udp_treats_icmp_refusal_as_retryable() {
+        let dead_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_peer = dead_socket.local_addr().unwrap();
+        drop(dead_socket);
+
+        let mut transport =
+            ConnectedUdpTransport::bind("127.0.0.1:0".parse().unwrap(), dead_peer).unwrap();
+        for _ in 0..3 {
+            transport
+                .send_datagram(MonoNs::ZERO, b"unbound")
+                .expect("ICMP refusal must not make send fatal");
+            std::thread::sleep(Duration::from_millis(10));
+            transport
+                .wait_readable(Some(Duration::from_millis(25)))
+                .expect("ICMP refusal must not make readiness fatal");
+            assert!(
+                transport
+                    .recv_datagram(MonoNs::ZERO)
+                    .expect("ICMP refusal must not make receive fatal")
+                    .is_none()
+            );
+        }
+        assert!(is_retryable_udp_io(io::ErrorKind::ConnectionRefused));
+        assert!(is_retryable_udp_io(io::ErrorKind::ConnectionReset));
+    }
+
+    #[test]
+    fn connected_udp_locks_to_the_first_observed_peer() {
+        let expected = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = expected.local_addr().unwrap();
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut receiver =
+            ConnectedUdpTransport::from_socket(receiver_socket, sender_addr).unwrap();
+
+        let first_bytes = conet_datagram(b"first");
+        expected.send_to(&first_bytes, receiver_addr).unwrap();
+        let first = recv_connected(&mut receiver, Duration::from_secs(1)).expect("expected peer");
+        assert_eq!(first.bytes.as_slice(), first_bytes);
+        assert_eq!(receiver.learned_peer_addr(), Some(sender_addr));
+
+        intruder
+            .send_to(&conet_datagram(b"intruder"), receiver_addr)
+            .unwrap();
+        let second_bytes = conet_datagram(b"second");
+        expected.send_to(&second_bytes, receiver_addr).unwrap();
+        let second = recv_connected(&mut receiver, Duration::from_secs(1))
+            .expect("expected peer after intruder");
+        assert_eq!(second.bytes.as_slice(), second_bytes);
+        assert_eq!(second.meta.source, Some(sender_addr));
+        assert_eq!(receiver.learned_peer_addr(), Some(sender_addr));
+        assert!(receiver.peer_reject_stats().locked_conflict >= 1);
+        assert_eq!(receiver.peer_binding_state(), PeerBindingState::Locked);
     }
 
     #[test]

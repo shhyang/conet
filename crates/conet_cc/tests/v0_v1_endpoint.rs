@@ -57,8 +57,6 @@ fn malformed_and_unauthenticated_feedback_do_not_clear_inflight() {
         Box::new(conet_core::FixedRateController::new(u64::MAX)),
         Some(Box::new(AckReceiver::new())),
     );
-    sender.establish_for_test(0x5151, 1).unwrap();
-    receiver.establish_for_test(0x5151, 1).unwrap();
     sender
         .enqueue_file_data(payload_packet(b"one-substrate-packet"))
         .unwrap();
@@ -105,8 +103,6 @@ fn cubic_controller_installs_on_the_sim_hook_and_receives_opaque_acks() {
         Box::new(conet_core::FixedRateController::new(u64::MAX)),
         Some(Box::new(AckReceiver::new())),
     );
-    sender.establish_for_test(0x6161, 1).unwrap();
-    receiver.establish_for_test(0x6161, 1).unwrap();
     for byte in 0..3 {
         sender
             .enqueue_file_data(payload_packet([byte; 500]))
@@ -143,7 +139,6 @@ fn malformed_and_replayed_feedback_use_private_identity_without_link_burn() {
         Box::new(BookkeepingTestController::new(10_000)),
         None,
     );
-    sender.establish_for_test(0x8181, 1).unwrap();
     for byte in 0..2 {
         sender
             .enqueue_file_data(payload_packet([byte; 100]))
@@ -187,3 +182,30 @@ fn malformed_and_replayed_feedback_use_private_identity_without_link_burn() {
     assert!(sender.controller_inflight_bytes().unwrap() < after_ack);
 }
 
+#[test]
+fn endpoint_restart_clears_the_controller_ledger_and_startup_window() {
+    let network = SimNetwork::new();
+    let mut sender = endpoint(
+        &network,
+        0,
+        Role::Initiator,
+        Box::new(BookkeepingTestController::new(1_000)),
+        None,
+    );
+    sender
+        .enqueue_file_data(payload_packet([0x11; 100]))
+        .unwrap();
+    assert_eq!(sender.drive(MonoNs::ZERO).sent, 1);
+    assert!(sender.controller_inflight_bytes().unwrap() > 0);
+
+    assert_eq!(sender.restart().unwrap(), 2);
+    assert_eq!(sender.controller_inflight_bytes(), Some(0));
+    assert_eq!(sender.inflight_limit_bytes(), Some(1_000));
+
+    sender
+        .enqueue_file_data(payload_packet([0x22; 100]))
+        .unwrap();
+    let report = sender.drive(MonoNs::new(1_000_000));
+    assert_eq!(report.sent, 1);
+    assert_eq!(sender.sent().len(), 2);
+}

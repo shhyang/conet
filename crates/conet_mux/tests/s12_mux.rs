@@ -317,13 +317,23 @@ fn mux_surfaces_and_preserves_lower_controller_wakeup() {
 }
 
 #[test]
-fn mux_aggregate_drive_uses_lower_pacer_and_handshake_times() {
+fn mux_reports_no_wakeup_when_lower_has_none() {
+    let (mut mux, _peer_in, _peer_out) = setup(limits(8, 4096));
+
+    assert_eq!(mux.next_wakeup(), None);
+    assert_eq!(mux.next_drive(), None);
+    let report = mux.drive(MonoNs::new(1), 8);
+    assert_eq!(report.next_wakeup, None);
+    assert_eq!(report.next_drive, None);
+}
+
+#[test]
+fn mux_aggregate_drive_uses_only_lower_pacer_times() {
     let network = SimNetwork::new();
-    let mut endpoint = UdpLiEndpoint::new(
+    let endpoint = UdpLiEndpoint::new(
         network.transport(0),
         EndpointConfig::new(Role::Initiator, 1_000),
     );
-    endpoint.establish_for_test(0x8181, 1).unwrap();
     let mut mux = Mux::new(UdpMuxLower::new(endpoint));
     let mut user = mux
         .attach(31, AttachLimits::symmetrical(limits(8, 4096)))
@@ -347,14 +357,13 @@ fn mux_aggregate_drive_uses_lower_pacer_and_handshake_times() {
     assert_eq!(report.next_drive, None);
 
     let network = SimNetwork::new();
-    let mut endpoint = UdpLiEndpoint::new(
+    let endpoint = UdpLiEndpoint::new(
         network.transport(1),
         EndpointConfig::new(Role::Initiator, 1_000),
     );
-    endpoint.start_association().unwrap();
     let mux = Mux::new(UdpMuxLower::new(endpoint));
     assert_eq!(mux.next_wakeup(), None);
-    assert_eq!(mux.next_drive(), Some(MonoNs::ZERO));
+    assert_eq!(mux.next_drive(), None);
 }
 
 #[test]

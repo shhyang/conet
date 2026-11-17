@@ -1,9 +1,9 @@
 use conet_core::{
-    BackingAccounting, BlockId, ControlMessage, ControlType, Feedback, FeedbackKind, OpaqueBytes,
-    PacketMetrics, PayloadCopyCounter, QosClass, REFERENCE_WIRE_HEADER_LEN, ReferenceWireCodec,
-    ReliabilityContentError, SymbolId, WireError, WireFlags, WireHeader,
-    decode_reliability_data, decode_reliability_feedback, encode_reliability_data,
-    encode_reliability_feedback,
+    BackingAccounting, BlockId, ControlMessage, ControlType, DiscreteRatePacer, Feedback,
+    FeedbackKind, FixedRateController, OpaqueBytes, PacketMetrics, PayloadCopyCounter, QosClass,
+    REFERENCE_WIRE_HEADER_LEN, RatePacer, ReferenceWireCodec, ReliabilityContentError, SymbolId,
+    TxController, WireDatagram, WireError, WireFlags, WireHeader, decode_reliability_data,
+    decode_reliability_feedback, encode_reliability_data, encode_reliability_feedback,
 };
 
 const GOOD_CORPUS: &[(&str, &str)] = &[
@@ -109,6 +109,13 @@ fn header(qos: QosClass) -> WireHeader {
         link_seq: 7,
         payload_len: 0,
     }
+}
+
+fn parse_to_upward(
+    codec: &ReferenceWireCodec,
+    bytes: OpaqueBytes,
+) -> Result<WireDatagram, WireError> {
+    codec.parse(bytes)
 }
 
 #[test]
@@ -461,6 +468,47 @@ fn m11_validate_before_freeze_never_exposes_invalid_handle_or_payload() {
     );
     assert_eq!(accounting.snapshot().live_count, 1);
     assert_eq!(copies.count(), 0);
+}
+
+#[test]
+fn t13_unknown_version_and_must_be_zero_violations_do_not_change_rate() {
+    let codec = ReferenceWireCodec::default();
+    let initial_rate = 4_000;
+    let controller = FixedRateController::new(initial_rate);
+    let pacer = DiscreteRatePacer::new(initial_rate);
+    let mut accepted_payloads = Vec::new();
+
+    for name in ["bad_version", "bad_flag_bits"] {
+        match parse_to_upward(&codec, OpaqueBytes::from(corpus_bytes(name))) {
+            Ok(datagram) => accepted_payloads.push(datagram.packet().payload_bytes().to_vec()),
+            Err(_) => {}
+        }
+    }
+
+    assert!(accepted_payloads.is_empty());
+    assert_eq!(controller.pace().target_rate(), Some(initial_rate));
+    assert_eq!(pacer.target_rate(), initial_rate);
+}
+
+#[test]
+fn t14_unknown_control_and_qos_are_not_demuxed_as_data_or_rate() {
+    let codec = ReferenceWireCodec::default();
+    let initial_rate = 6_000;
+    let controller = FixedRateController::new(initial_rate);
+    let pacer = DiscreteRatePacer::new(initial_rate);
+    let mut accepted = Vec::new();
+
+    for name in ["bad_control_type", "bad_qos_class"] {
+        let result = parse_to_upward(&codec, OpaqueBytes::from(corpus_bytes(name)));
+        assert!(result.is_err(), "{name} must be dropped");
+        if let Ok(datagram) = result {
+            accepted.push(datagram.into_packet());
+        }
+    }
+
+    assert!(accepted.is_empty());
+    assert_eq!(controller.pace().target_rate(), Some(initial_rate));
+    assert_eq!(pacer.target_rate(), initial_rate);
 }
 
 #[test]

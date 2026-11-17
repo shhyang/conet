@@ -2,8 +2,8 @@
 //!
 //! This is intentionally not a Linux TCP-CUBIC port. It implements the classic
 //! cubic curve, a multiplicative decrease, exact-sequence inflight accounting,
-//! and a small deterministic timer. Several Linux CUBIC behaviors are omitted
-//! on purpose for this research/validation controller.
+//! and a small deterministic timer. See `RESULTS.md` in the validation job for
+//! the complete simplification list.
 
 use conet_core::{ControlDisposition, Delivery, MonoNs, OpaqueBytes, Pace, TxController};
 

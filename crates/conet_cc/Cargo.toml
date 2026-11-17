@@ -15,4 +15,5 @@ path = "src/lib.rs"
 conet_core = { path = "../conet_core" }
 
 [dev-dependencies]
+conet_transfer = { path = "../conet_transfer" }
 conet_udp = { path = "../conet_udp" }

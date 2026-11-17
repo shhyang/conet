@@ -8,7 +8,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
 
 use conet_core::{
     BackingAccounting, BidirectionalAck, BlockCodec, BlockId, BlockShape, BlockStatus,
@@ -20,14 +21,19 @@ use conet_core::{
 };
 use conet_fountain::{FountainBlockCodec, FountainCodecConfig};
 use conet_udp::{
-    AssociationState, DatagramTransport, EndpointConfig, LoopbackUdpTransport,
-    ProfileEnqueueErrorKind, Role, SendClass, SimNetwork, UdpLiEndpoint, payload_packet,
+    ConnectedUdpTransport, DatagramTransport, DriveReport, EndpointConfig, LocalSendOutcome,
+    LoopbackUdpTransport, PeerAdmitPolicy, ProfileEnqueueErrorKind, ReflexiveReport, Role,
+    SendClass, SimNetwork, UdpLiEndpoint, discover_reflexive, payload_packet,
+    serve_reflexive_until,
 };
 
 const MANIFEST_MAGIC: [u8; 4] = *b"OCNM";
 const MANIFEST_VERSION: u8 = 1;
 const BLOCK_ID: BlockId = BlockId::new(1);
 const MANIFEST_INTERVAL: MonoNs = MonoNs::new(100_000_000);
+const UDP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const UDP_READY_WAIT: Option<Duration> = Some(Duration::from_millis(250));
 
 /// Application policy and framing controls.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,10 +43,11 @@ pub struct FileTransferConfig {
     pub one_way_symbol_budget: Option<u64>,
     pub closed_loop: bool,
     pub target_rate: u64,
-    pub ack_repeats: u32,
-    pub ack_interval: MonoNs,
     pub nack_interval: MonoNs,
     pub linger: MonoNs,
+    /// UL-2/UL-6 lab bridge: admit the first Conet source IP even when it
+    /// disagrees with `--peer` (HTTP vs UDP egress). Off by default.
+    pub lab_observe_ip: bool,
 }
 
 impl Default for FileTransferConfig {
@@ -51,10 +58,9 @@ impl Default for FileTransferConfig {
             one_way_symbol_budget: None,
             closed_loop: false,
             target_rate: 1_000_000,
-            ack_repeats: 3,
-            ack_interval: MonoNs::new(50_000_000),
             nack_interval: MonoNs::new(100_000_000),
             linger: MonoNs::new(2_000_000_000),
+            lab_observe_ip: false,
         }
     }
 }
@@ -88,6 +94,36 @@ pub struct TransferReport {
     pub recovered_file: Vec<u8>,
 }
 
+/// Sender-side result for one explicit-address UDP transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpSendReport {
+    pub file_name: String,
+    pub file_len: usize,
+    pub source_symbols: u32,
+    pub symbol_len: usize,
+    pub stated_symbol_budget: u64,
+    pub generated_symbols: u64,
+    pub closed_loop: bool,
+    pub sender_status: BlockStatus,
+    pub data_datagrams_sent: usize,
+    pub feedback_datagrams_sent: usize,
+    pub acks_received: usize,
+    pub nacks_received: usize,
+}
+
+/// Receiver-side result for one explicit-address UDP transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpReceiveReport {
+    pub file_name: String,
+    pub file_len: usize,
+    pub source_symbols: u32,
+    pub symbol_len: usize,
+    pub data_datagrams_received: usize,
+    pub manifests_received: usize,
+    pub feedback_datagrams_sent: usize,
+    pub recovered_file: Vec<u8>,
+}
+
 /// Invalid manifest, file, or transfer configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransferError {
@@ -98,7 +134,7 @@ pub enum TransferError {
         expected: usize,
         actual: usize,
     },
-    AssociationFailed,
+    LinkFailed,
     Codec(String),
     NotRecovered {
         generated: u64,
@@ -108,6 +144,7 @@ pub enum TransferError {
         received_symbols: usize,
     },
     Io(String),
+    TimedOut(&'static str),
 }
 
 impl fmt::Display for TransferError {
@@ -119,7 +156,7 @@ impl fmt::Display for TransferError {
             Self::InvalidFileLength { expected, actual } => {
                 write!(f, "recovered file length {actual}, expected {expected}")
             }
-            Self::AssociationFailed => f.write_str("association did not establish"),
+            Self::LinkFailed => f.write_str("UDP link send failed"),
             Self::Codec(error) => write!(f, "fountain codec error: {error}"),
             Self::NotRecovered {
                 generated,
@@ -132,6 +169,7 @@ impl fmt::Display for TransferError {
                 "file not recovered after {generated} generated symbols and {received_symbols} received symbols (budget {budget}; {data_datagrams_received} data datagrams, {manifests_received} manifests)"
             ),
             Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::TimedOut(phase) => write!(f, "UDP transfer timed out during {phase}"),
         }
     }
 }
@@ -224,10 +262,6 @@ pub fn run_simulated_transfer(
         network.transport(1),
         endpoint_config(Role::Responder, config.target_rate),
     );
-    sender
-        .start_association()
-        .map_err(|_| TransferError::AssociationFailed)?;
-    let now = establish(&mut sender, &mut receiver, MonoNs::ZERO)?;
     if let Some(every) = impairment.forward_loss_every {
         network.set_loss_pattern(0, loss_pattern(every));
     }
@@ -240,7 +274,7 @@ pub fn run_simulated_transfer(
         file_name,
         file,
         config,
-        now,
+        MonoNs::ZERO,
         false,
     )
 }
@@ -269,56 +303,346 @@ pub fn run_loopback_transfer(
         transport_b,
         endpoint_config(Role::Responder, config.target_rate).test_open(),
     );
-    sender
-        .start_association()
-        .map_err(|_| TransferError::AssociationFailed)?;
-
-    let mut now = MonoNs::ZERO;
-    let started = std::time::Instant::now();
-    while sender.state() != AssociationState::Established
-        || receiver.state() != AssociationState::Established
-    {
-        if started.elapsed() > std::time::Duration::from_secs(2) {
-            return Err(TransferError::AssociationFailed);
-        }
-        sender.drive(now);
-        receiver.drive(now);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        now = now.saturating_add(ms(1));
-    }
     run_established_pair(
         &mut sender,
         &mut receiver,
         file_name,
         file,
         config,
-        now,
+        MonoNs::ZERO,
         true,
     )
 }
 
-fn endpoint_config(role: Role, target_rate: u64) -> EndpointConfig {
+fn peer_policy(config: &FileTransferConfig) -> PeerAdmitPolicy {
+    if config.lab_observe_ip {
+        PeerAdmitPolicy::lab_observe_ip()
+    } else {
+        PeerAdmitPolicy::default()
+    }
+}
+
+/// UL-6: probe a reflexive helper from `listen` on the association socket.
+///
+/// The result is a candidate for out-of-band `--peer` exchange. It is not a
+/// validated path identity. Do not substitute an HTTP public-IP lookup.
+pub fn run_reflexive_probe(
+    listen: SocketAddr,
+    helper: SocketAddr,
+    timeout: Duration,
+) -> Result<ReflexiveReport, TransferError> {
+    let socket = UdpSocket::bind(listen).map_err(io_error)?;
+    socket.set_nonblocking(true).map_err(io_error)?;
+    discover_reflexive(&socket, helper, timeout).map_err(|error| TransferError::Io(error.to_string()))
+}
+
+/// UL-6: serve reflexive requests on `listen` until `duration` elapses.
+pub fn run_reflexive_helper(listen: SocketAddr, duration: Duration) -> Result<u64, TransferError> {
+    let socket = UdpSocket::bind(listen).map_err(io_error)?;
+    serve_reflexive_until(&socket, Instant::now() + duration)
+        .map_err(|error| TransferError::Io(error.to_string()))
+}
+
+/// Send a file to one explicit UDP peer.
+///
+/// `listen` and `peer` may use any local or remote addresses, including
+/// loopback. `peer` is the initial destination and IP filter; the transport
+/// learns and locks the observed source endpoint before the socket closes.
+/// Prefer a same-socket reflexive candidate (UL-6) over an HTTP public IP.
+pub fn run_udp_sender(
+    listen: SocketAddr,
+    peer: SocketAddr,
+    file_name: &str,
+    file: &[u8],
+    config: FileTransferConfig,
+) -> Result<UdpSendReport, TransferError> {
+    validate_file(file_name, file)?;
+    let transport =
+        ConnectedUdpTransport::bind_with_policy(listen, peer, peer_policy(&config)).map_err(io_error)?;
+    let mut endpoint = UdpLiEndpoint::new(
+        transport,
+        endpoint_config(Role::Initiator, config.target_rate).test_open(),
+    );
+    let started = Instant::now();
+    let mut now = udp_clock(started);
+    let copies = PayloadCopyCounter::new();
+    let mut codec = fountain_codec(&config, copies.clone()).map_err(codec_error)?;
+    let shape = codec
+        .add_block(BLOCK_ID, file.to_vec())
+        .map_err(codec_error)?;
+    let manifest = FileManifest {
+        shape,
+        file_name: file_name.to_owned(),
+    };
+    let budget = config
+        .one_way_symbol_budget
+        .unwrap_or_else(|| default_symbol_budget(shape.source_symbols, config.closed_loop));
+    let metrics = PacketMetrics {
+        backings: BackingAccounting::new(),
+        payload_copies: copies,
+    };
+    let mut next_manifest_at = now;
+    let mut feedback_queue = PacketQueue::new(QueueLimits::new(64, 64 * 1024, 64 * 1024));
+    let mut acks_received = 0;
+    let mut nacks_received = 0;
+
+    if config.closed_loop {
+        let policy = BidirectionalAck::new(budget, config.linger)
+            .with_time_budget(MonoNs::new(20_000_000_000));
+        let mut sender = ReliabilitySender::new(
+            codec,
+            policy,
+            QueueLimits::new(256, 512 * 1024, 512 * 1024),
+            metrics,
+        );
+        sender
+            .register_block(BLOCK_ID, now)
+            .map_err(|error| TransferError::Codec(error.to_string()))?;
+        loop {
+            if started.elapsed() > UDP_TRANSFER_TIMEOUT {
+                return Err(TransferError::TimedOut("send"));
+            }
+            if now >= next_manifest_at {
+                enqueue_manifest(&mut endpoint, &manifest)?;
+                next_manifest_at = now.saturating_add(MANIFEST_INTERVAL);
+            }
+            let mut outgoing = UdpUserSender {
+                endpoint: &mut endpoint,
+            };
+            sender.pump(&mut outgoing, now, 1, 4);
+            let drive = endpoint
+                .drive_when_ready_with_timeout(|| udp_clock(started), UDP_READY_WAIT)
+                .map_err(io_error)?;
+            check_send_outcome(&drive)?;
+            collect_feedback(
+                &mut endpoint,
+                &mut feedback_queue,
+                &mut acks_received,
+                &mut nacks_received,
+            );
+            sender.receive_feedback(&mut feedback_queue, now, 64);
+            let status = sender.status(BLOCK_ID).unwrap_or(BlockStatus::Sending);
+            let generated_symbols = sender.generated_symbols(BLOCK_ID).unwrap_or(0);
+            now = udp_clock(started);
+            if matches!(
+                status,
+                BlockStatus::Delivered
+                    | BlockStatus::StoppedByBudget
+                    | BlockStatus::StoppedWithoutAck
+            ) && sender.staged_packets() == 0
+                && endpoint.queued(SendClass::FileData) == 0
+            {
+                return Ok(UdpSendReport {
+                    file_name: file_name.to_owned(),
+                    file_len: file.len(),
+                    source_symbols: shape.source_symbols,
+                    symbol_len: shape.symbol_len,
+                    stated_symbol_budget: budget,
+                    generated_symbols,
+                    closed_loop: true,
+                    sender_status: status,
+                    data_datagrams_sent: endpoint
+                        .sent()
+                        .iter()
+                        .filter(|sent| sent.class == SendClass::FileData)
+                        .count(),
+                    feedback_datagrams_sent: endpoint
+                        .sent()
+                        .iter()
+                        .filter(|sent| sent.class == SendClass::Feedback)
+                        .count(),
+                    acks_received,
+                    nacks_received,
+                });
+            }
+        }
+    }
+
+    let mut sender = ReliabilitySender::new(
+        codec,
+        OneWayBudget::new(budget).with_time_budget(MonoNs::new(20_000_000_000)),
+        QueueLimits::new(256, 512 * 1024, 512 * 1024),
+        metrics,
+    );
+    sender
+        .register_block(BLOCK_ID, now)
+        .map_err(|error| TransferError::Codec(error.to_string()))?;
+    loop {
+        if started.elapsed() > UDP_TRANSFER_TIMEOUT {
+            return Err(TransferError::TimedOut("send"));
+        }
+        if now >= next_manifest_at {
+            enqueue_manifest(&mut endpoint, &manifest)?;
+            next_manifest_at = now.saturating_add(MANIFEST_INTERVAL);
+        }
+        let mut outgoing = UdpUserSender {
+            endpoint: &mut endpoint,
+        };
+        sender.pump(&mut outgoing, now, 1, 4);
+        let drive = endpoint
+            .drive_when_ready_with_timeout(|| udp_clock(started), UDP_READY_WAIT)
+            .map_err(io_error)?;
+        check_send_outcome(&drive)?;
+        let status = sender.status(BLOCK_ID).unwrap_or(BlockStatus::Sending);
+        let generated_symbols = sender.generated_symbols(BLOCK_ID).unwrap_or(0);
+        now = udp_clock(started);
+        if status == BlockStatus::StoppedByBudget
+            && sender.staged_packets() == 0
+            && endpoint.queued(SendClass::FileData) == 0
+        {
+            return Ok(UdpSendReport {
+                file_name: file_name.to_owned(),
+                file_len: file.len(),
+                source_symbols: shape.source_symbols,
+                symbol_len: shape.symbol_len,
+                stated_symbol_budget: budget,
+                generated_symbols,
+                closed_loop: false,
+                sender_status: status,
+                data_datagrams_sent: endpoint
+                    .sent()
+                    .iter()
+                    .filter(|sent| sent.class == SendClass::FileData)
+                    .count(),
+                feedback_datagrams_sent: 0,
+                acks_received: 0,
+                nacks_received: 0,
+            });
+        }
+    }
+}
+
+/// Receive one file from one explicit UDP peer.
+///
+/// The receiver accepts a small file encoded with the same transfer manifest
+/// and fountain block format as the other modes. The socket is closed when the
+/// file is recovered or the bounded wait expires.
+pub fn run_udp_receiver(
+    listen: SocketAddr,
+    peer: SocketAddr,
+    config: FileTransferConfig,
+) -> Result<UdpReceiveReport, TransferError> {
+    let transport =
+        ConnectedUdpTransport::bind_with_policy(listen, peer, peer_policy(&config)).map_err(io_error)?;
+    let mut endpoint = UdpLiEndpoint::new(
+        transport,
+        endpoint_config(Role::Responder, config.target_rate).test_open(),
+    );
+    let started = Instant::now();
+    let mut now = udp_clock(started);
+    let mut codec = fountain_codec(&config, PayloadCopyCounter::new()).map_err(codec_error)?;
+    let mut state = ReceiverState {
+        manifest: None,
+        received_symbols: 0,
+        data_datagrams: 0,
+        manifests_received: 0,
+        recovered: false,
+        next_nack_at: now,
+    };
+    let mut last_progress = Instant::now();
+
+    while !state.recovered {
+        if started.elapsed() > UDP_TRANSFER_TIMEOUT {
+            return Err(TransferError::TimedOut("receive"));
+        }
+        if last_progress.elapsed() > UDP_IDLE_TIMEOUT {
+            return Err(TransferError::TimedOut("receive idle"));
+        }
+        let drive = endpoint
+            .drive_when_ready_with_timeout(|| udp_clock(started), UDP_READY_WAIT)
+            .map_err(io_error)?;
+        check_send_outcome(&drive)?;
+        if drive.received > 0 || drive.sent > 0 {
+            last_progress = Instant::now();
+        }
+        now = udp_clock(started);
+        state.process(&mut endpoint, &mut codec, now, config.closed_loop, &config)?;
+    }
+
+    // One-way senders cannot learn that recovery happened. Keep consuming for
+    // the same bounded linger used by the closed-loop policy so they can drain
+    // their local symbol budget without racing socket teardown.
+    let linger_started = Instant::now();
+    let linger = Duration::from_nanos(u64::try_from(config.linger.as_nanos()).unwrap_or(u64::MAX));
+    while linger_started.elapsed() < linger {
+        let drive = endpoint
+            .drive_when_ready_with_timeout(|| udp_clock(started), UDP_READY_WAIT)
+            .map_err(io_error)?;
+        check_send_outcome(&drive)?;
+        now = udp_clock(started);
+        state.process(&mut endpoint, &mut codec, now, config.closed_loop, &config)?;
+    }
+
+    let manifest = state
+        .manifest
+        .as_ref()
+        .ok_or(TransferError::InvalidManifest("missing manifest"))?;
+    let shape = manifest.shape;
+    let recovered_file = take_recovered(
+        &mut codec,
+        &state,
+        shape,
+        0,
+        config.one_way_symbol_budget.unwrap_or(0),
+    )?;
+    Ok(UdpReceiveReport {
+        file_name: manifest.file_name.clone(),
+        file_len: shape.block_len,
+        source_symbols: shape.source_symbols,
+        symbol_len: shape.symbol_len,
+        data_datagrams_received: state.data_datagrams,
+        manifests_received: state.manifests_received,
+        feedback_datagrams_sent: endpoint
+            .sent()
+            .iter()
+            .filter(|sent| sent.class == SendClass::Feedback)
+            .count(),
+        recovered_file,
+    })
+}
+
+fn udp_clock(started: Instant) -> MonoNs {
+    let nanos = started.elapsed().as_nanos();
+    MonoNs::new(i64::try_from(nanos).unwrap_or(i64::MAX))
+}
+
+/// Build the reference-transfer endpoint config (association id shared by both ends).
+pub fn transfer_endpoint_config(role: Role, target_rate: u64) -> EndpointConfig {
     let mut config = EndpointConfig::new(role, target_rate);
     config.initial_association_id = 0x5100_0001;
     config
 }
 
-fn establish<T: DatagramTransport, U: DatagramTransport>(
-    sender: &mut UdpLiEndpoint<T>,
-    receiver: &mut UdpLiEndpoint<U>,
-    mut now: MonoNs,
-) -> Result<MonoNs, TransferError> {
-    for _ in 0..2_000 {
-        sender.drive(now);
-        receiver.drive(now);
-        if sender.state() == AssociationState::Established
-            && receiver.state() == AssociationState::Established
-        {
-            return Ok(now);
-        }
-        now = now.saturating_add(ms(1));
-    }
-    Err(TransferError::AssociationFailed)
+fn endpoint_config(role: Role, target_rate: u64) -> EndpointConfig {
+    transfer_endpoint_config(role, target_rate)
+}
+
+/// Run a file transfer on caller-built endpoints.
+///
+/// Callers may install any `TxController` / `RxController` on the endpoints
+/// before invoking this helper. Default CLI paths keep
+/// [`UdpLiEndpoint::new`] / fixed-rate.
+///
+/// Set `real_udp` when the transports are real sockets (loopback/WAN) so the
+/// driver yields briefly between ticks.
+pub fn run_pair_transfer<T: DatagramTransport, U: DatagramTransport>(
+    sender_endpoint: &mut UdpLiEndpoint<T>,
+    receiver_endpoint: &mut UdpLiEndpoint<U>,
+    file_name: &str,
+    file: &[u8],
+    config: FileTransferConfig,
+    real_udp: bool,
+) -> Result<TransferReport, TransferError> {
+    validate_file(file_name, file)?;
+    run_established_pair(
+        sender_endpoint,
+        receiver_endpoint,
+        file_name,
+        file,
+        config,
+        MonoNs::ZERO,
+        real_udp,
+    )
 }
 
 fn run_established_pair<T: DatagramTransport, U: DatagramTransport>(
@@ -356,7 +680,6 @@ fn run_established_pair<T: DatagramTransport, U: DatagramTransport>(
         manifests_received: 0,
         recovered: false,
         next_nack_at: now,
-        ack: None,
     };
     let mut feedback_queue = PacketQueue::new(QueueLimits::new(64, 64 * 1024, 64 * 1024));
     let mut acks_received = 0;
@@ -391,8 +714,8 @@ fn run_established_pair<T: DatagramTransport, U: DatagramTransport>(
                 endpoint: sender_endpoint,
             };
             sender.pump(&mut outgoing, now, 1, 4);
-            sender_endpoint.drive(now);
-            receiver_endpoint.drive(now);
+            check_send_outcome(&sender_endpoint.drive(now))?;
+            check_send_outcome(&receiver_endpoint.drive(now))?;
             receiver_state.process(receiver_endpoint, &mut receiver_codec, now, true, &config)?;
             collect_feedback(
                 sender_endpoint,
@@ -451,8 +774,8 @@ fn run_established_pair<T: DatagramTransport, U: DatagramTransport>(
             endpoint: sender_endpoint,
         };
         sender.pump(&mut outgoing, now, 1, 4);
-        sender_endpoint.drive(now);
-        receiver_endpoint.drive(now);
+        check_send_outcome(&sender_endpoint.drive(now))?;
+        check_send_outcome(&receiver_endpoint.drive(now))?;
         receiver_state.process(receiver_endpoint, &mut receiver_codec, now, false, &config)?;
         generated_symbols = sender.generated_symbols(BLOCK_ID).unwrap_or(0);
         sender_status = sender.status(BLOCK_ID).unwrap_or(BlockStatus::Sending);
@@ -539,12 +862,6 @@ struct ReceiverState {
     manifests_received: usize,
     recovered: bool,
     next_nack_at: MonoNs,
-    ack: Option<AckSchedule>,
-}
-
-struct AckSchedule {
-    repeats_left: u32,
-    next_at: MonoNs,
 }
 
 impl ReceiverState {
@@ -606,11 +923,7 @@ impl ReceiverState {
                 if closed_loop {
                     endpoint
                         .enqueue_feedback_value(Feedback::ack(BLOCK_ID))
-                        .map_err(|_| TransferError::AssociationFailed)?;
-                    self.ack = Some(AckSchedule {
-                        repeats_left: config.ack_repeats,
-                        next_at: now.saturating_add(config.ack_interval),
-                    });
+                        .map_err(|_| TransferError::LinkFailed)?;
                 }
             } else if closed_loop
                 && matches!(status, conet_core::DecodeStatus::NeedMore)
@@ -622,22 +935,11 @@ impl ReceiverState {
                         self.received_symbols as u32,
                         0,
                     ))
-                    .map_err(|_| TransferError::AssociationFailed)?;
+                    .map_err(|_| TransferError::LinkFailed)?;
                 self.next_nack_at = now.saturating_add(config.nack_interval);
             }
         }
 
-        if closed_loop
-            && let Some(ack) = self.ack.as_mut()
-            && ack.repeats_left > 0
-            && now >= ack.next_at
-        {
-            endpoint
-                .enqueue_feedback_value(Feedback::ack(BLOCK_ID))
-                .map_err(|_| TransferError::AssociationFailed)?;
-            ack.repeats_left -= 1;
-            ack.next_at = now.saturating_add(config.ack_interval);
-        }
         Ok(())
     }
 }
@@ -702,7 +1004,7 @@ fn enqueue_manifest<T: DatagramTransport>(
 ) -> Result<(), TransferError> {
     endpoint
         .enqueue_file_data(payload_packet(manifest.encode()))
-        .map_err(|_| TransferError::AssociationFailed)?;
+        .map_err(|_| TransferError::LinkFailed)?;
     Ok(())
 }
 
@@ -747,6 +1049,13 @@ fn codec_error(error: conet_core::CodecError) -> TransferError {
 
 fn io_error(error: std::io::Error) -> TransferError {
     TransferError::Io(error.to_string())
+}
+
+fn check_send_outcome(report: &DriveReport) -> Result<(), TransferError> {
+    if report.send_outcome == Some(LocalSendOutcome::Fatal) {
+        return Err(TransferError::LinkFailed);
+    }
+    Ok(())
 }
 
 fn advance(now: MonoNs, real_loopback: bool) -> MonoNs {
@@ -809,7 +1118,7 @@ mod wire_demux_tests {
         OpaqueBytes, QosClass, ReferenceWireCodec, WireFlags, WireHeader,
         encode_reliability_feedback,
     };
-    use conet_udp::{Role, SimNetwork};
+    use conet_udp::{DriveReport, LocalSendOutcome, Role, SimNetwork};
 
     fn inject_body(endpoint: &SimNetwork, qos: QosClass, body: Vec<u8>) {
         let codec = ReferenceWireCodec::default();
@@ -835,7 +1144,6 @@ mod wire_demux_tests {
             network.transport(1),
             EndpointConfig::new(Role::Responder, u64::MAX),
         );
-        endpoint.establish_for_test(1, 1).unwrap();
         inject_body(
             &network,
             QosClass::Bulk,
@@ -858,7 +1166,6 @@ mod wire_demux_tests {
             network.transport(1),
             EndpointConfig::new(Role::Responder, u64::MAX),
         );
-        endpoint.establish_for_test(1, 1).unwrap();
         let manifest = FileManifest {
             shape: BlockShape::new(4, 4, 16).unwrap(),
             file_name: "qos-independent.bin".into(),
@@ -873,7 +1180,6 @@ mod wire_demux_tests {
             manifests_received: 0,
             recovered: false,
             next_nack_at: MonoNs::ZERO,
-            ack: None,
         };
         let mut codec = FountainBlockCodec::new(
             FountainCodecConfig {
@@ -894,5 +1200,99 @@ mod wire_demux_tests {
             .unwrap();
         assert_eq!(state.manifests_received, 1);
         assert_eq!(state.manifest, Some(manifest));
+    }
+
+    #[test]
+    fn only_fatal_local_send_outcomes_fail_the_transfer_link() {
+        for outcome in [
+            LocalSendOutcome::WouldBlock,
+            LocalSendOutcome::TransientDrop,
+            LocalSendOutcome::Interrupted,
+        ] {
+            let report = DriveReport {
+                send_failed: true,
+                send_outcome: Some(outcome),
+                ..DriveReport::default()
+            };
+            assert_eq!(check_send_outcome(&report), Ok(()));
+        }
+
+        let report = DriveReport {
+            send_failed: true,
+            send_outcome: Some(LocalSendOutcome::Fatal),
+            ..DriveReport::default()
+        };
+        assert_eq!(check_send_outcome(&report), Err(TransferError::LinkFailed));
+    }
+
+    #[test]
+    fn simulated_transfer_survives_nonfatal_local_send_errors() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::HostUnreachable,
+        ] {
+            let network = SimNetwork::new();
+            network.set_authenticated(true);
+            let mut sender = UdpLiEndpoint::new(
+                network.transport(0),
+                endpoint_config(Role::Initiator, 1_000_000),
+            );
+            let mut receiver = UdpLiEndpoint::new(
+                network.transport(1),
+                endpoint_config(Role::Responder, 1_000_000),
+            );
+            network.fail_next_send_with(0, kind);
+            let source: Vec<u8> = (0..4_097).map(|value| value as u8).collect();
+            let config = FileTransferConfig {
+                // Keep generating symbols beyond the next periodic manifest
+                // after the injected write drops the initial manifest.
+                one_way_symbol_budget: Some(512),
+                ..FileTransferConfig::default()
+            };
+
+            let report = run_established_pair(
+                &mut sender,
+                &mut receiver,
+                "transient-local-send.bin",
+                &source,
+                config,
+                MonoNs::ZERO,
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{kind:?} became fatal: {error}"));
+
+            assert_eq!(report.recovered_file, source, "{kind:?}");
+            assert_eq!(sender.state(), conet_udp::AssociationState::Ready);
+        }
+    }
+
+    #[test]
+    fn simulated_transfer_fails_the_link_on_hard_send_error() {
+        let network = SimNetwork::new();
+        network.set_authenticated(true);
+        let mut sender = UdpLiEndpoint::new(
+            network.transport(0),
+            endpoint_config(Role::Initiator, 1_000_000),
+        );
+        let mut receiver = UdpLiEndpoint::new(
+            network.transport(1),
+            endpoint_config(Role::Responder, 1_000_000),
+        );
+        network.fail_next_send_with(0, std::io::ErrorKind::InvalidInput);
+
+        let error = run_established_pair(
+            &mut sender,
+            &mut receiver,
+            "hard-local-send.bin",
+            b"hard-local-send",
+            FileTransferConfig::default(),
+            MonoNs::ZERO,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error, TransferError::LinkFailed);
     }
 }

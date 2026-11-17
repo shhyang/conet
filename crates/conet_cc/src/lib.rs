@@ -28,10 +28,7 @@ pub use cubic::{
     CUBIC_BETA, CUBIC_C, CUBIC_GROWTH_TICK, CubicController, DEFAULT_MSS_BYTES,
     INITIAL_WINDOW_SEGMENTS, MIN_WINDOW_SEGMENTS,
 };
-pub use feedback::{
-    AckReceiver, FEEDBACK_RESEND_INTERVAL, FeedbackEvent, FeedbackMessage, MAX_FEEDBACK_EVENTS,
-    MAX_FEEDBACK_RESENDS,
-};
+pub use feedback::{AckReceiver, FeedbackEvent, FeedbackMessage, MAX_FEEDBACK_EVENTS};
 pub use ledger::{InflightLedger, SentPacket};
 
 pub use conet_core::{

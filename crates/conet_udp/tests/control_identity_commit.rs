@@ -57,7 +57,6 @@ fn standalone_tx_control_commits_only_after_send() {
         Box::new(PollIdentityController::new(Arc::clone(&committed))),
         None,
     );
-    endpoint.establish_for_test(0xcc01, 1).unwrap();
     endpoint
         .enqueue_file_data(payload_packet(b"keep-pacer-progress"))
         .expect("data enqueue");

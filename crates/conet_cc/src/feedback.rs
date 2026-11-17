@@ -28,12 +28,6 @@ const MAX_TRACKED_GAP: u64 = 64;
 pub const MAX_FEEDBACK_EVENTS: usize =
     (MAX_FEEDBACK_BODY_LEN - LEGACY_HEADER_LEN) / SINGLE_EVENT_LEN;
 
-/// Delay between timer-driven copies of the latest feedback batch.
-pub const FEEDBACK_RESEND_INTERVAL: MonoNs = MonoNs::new(20_000_000);
-
-/// Number of timer-driven copies after the original feedback batch.
-pub const MAX_FEEDBACK_RESENDS: u8 = 2;
-
 /// One exact acknowledgement, cumulative acknowledgement, SACK range, or
 /// declared loss. SACK ranges are inclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,9 +303,6 @@ pub struct AckReceiver {
     received: BTreeSet<u64>,
     started: bool,
     cumulative: Option<u64>,
-    last_events: Option<(Option<u64>, Vec<FeedbackEvent>)>,
-    resend_at: Option<MonoNs>,
-    resends_remaining: u8,
     next_control_id: u32,
     pending_feedback: Option<PendingFeedback>,
 }
@@ -319,10 +310,6 @@ pub struct AckReceiver {
 #[derive(Debug)]
 struct PendingFeedback {
     body: OpaqueBytes,
-    rtt_ns: Option<u64>,
-    events: Vec<FeedbackEvent>,
-    original: bool,
-    scheduled_at: MonoNs,
 }
 
 impl AckReceiver {
@@ -334,9 +321,6 @@ impl AckReceiver {
             received: BTreeSet::new(),
             started: false,
             cumulative: None,
-            last_events: None,
-            resend_at: None,
-            resends_remaining: 0,
             next_control_id: 1,
             pending_feedback: None,
         }
@@ -543,52 +527,21 @@ impl RxController for AckReceiver {
             let events: Vec<_> = pending.into_iter().map(|(event, _)| event).collect();
             let body = self.encode_batch(rtt_ns, &events, self.next_control_id)?;
             self.pending.drain(..count);
-            self.pending_feedback = Some(PendingFeedback {
-                body: body.clone(),
-                rtt_ns,
-                events,
-                original: true,
-                scheduled_at: now,
-            });
-            return Some(body);
-        }
-        if self.resend_at.is_some_and(|deadline| now >= deadline) && self.resends_remaining > 0 {
-            let (rtt_ns, events) = self.last_events.clone()?;
-            let body = self.encode_batch(rtt_ns, &events, self.next_control_id)?;
-            self.pending_feedback = Some(PendingFeedback {
-                body: body.clone(),
-                rtt_ns,
-                events,
-                original: false,
-                scheduled_at: now,
-            });
+            self.pending_feedback = Some(PendingFeedback { body: body.clone() });
             return Some(body);
         }
         None
     }
 
     fn on_control_sent(&mut self, body: &OpaqueBytes) {
-        let Some(pending) = self
+        let matches_pending = self
             .pending_feedback
             .as_ref()
-            .filter(|pending| pending.body == *body)
-        else {
+            .is_some_and(|pending| pending.body == *body);
+        if !matches_pending {
             return;
-        };
-        let original = pending.original;
-        let rtt_ns = pending.rtt_ns;
-        let events = pending.events.clone();
-        let scheduled_at = pending.scheduled_at;
-
-        self.next_control_id = self.next_control_id.wrapping_add(1).max(1);
-        self.last_events = Some((rtt_ns, events));
-        if original {
-            self.resends_remaining = MAX_FEEDBACK_RESENDS;
-        } else {
-            self.resends_remaining = self.resends_remaining.saturating_sub(1);
         }
-        self.resend_at = (self.resends_remaining > 0)
-            .then(|| scheduled_at.saturating_add(FEEDBACK_RESEND_INTERVAL));
+        self.next_control_id = self.next_control_id.wrapping_add(1).max(1);
         self.pending_feedback = None;
     }
 
@@ -604,12 +557,7 @@ impl RxController for AckReceiver {
             .values()
             .map(|first_seen| first_seen.saturating_add(LOSS_TIMEOUT))
             .min();
-        match (loss_deadline, self.resend_at) {
-            (Some(loss), Some(resend)) => Some(loss.min(resend)),
-            (Some(loss), None) => Some(loss),
-            (None, Some(resend)) => Some(resend),
-            (None, None) => None,
-        }
+        loss_deadline
     }
 }
 
@@ -769,29 +717,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_feedback_batch_is_resent_on_a_bounded_timer() {
+    fn committed_feedback_is_not_resent_after_network_loss() {
         let mut receiver = AckReceiver::new();
         receiver.on_observed(data_observation(1, 0));
         let original = poll_sent(&mut receiver, MonoNs::new(1_000_000)).unwrap();
         assert!(FeedbackMessage::decode(&original).is_some());
-        assert_eq!(
-            receiver.next_wakeup(),
-            Some(MonoNs::new(1_000_000).saturating_add(FEEDBACK_RESEND_INTERVAL))
-        );
-
-        let mut copies = 0;
-        let original = FeedbackMessage::decode(&original).unwrap();
-        let mut now = MonoNs::new(1_000_000).saturating_add(FEEDBACK_RESEND_INTERVAL);
-        while let Some(copy) = poll_sent(&mut receiver, now) {
-            let copy = FeedbackMessage::decode(&copy).unwrap();
-            assert_eq!(copy.rtt_ns, original.rtt_ns);
-            assert_eq!(copy.events, original.events);
-            assert_ne!(copy.control_id, original.control_id);
-            copies += 1;
-            now = now.saturating_add(FEEDBACK_RESEND_INTERVAL);
-        }
-        assert_eq!(copies, usize::from(MAX_FEEDBACK_RESENDS));
         assert_eq!(receiver.next_wakeup(), None);
+        assert_eq!(poll_sent(&mut receiver, MonoNs::new(1_000_000_000)), None);
+        assert!(FeedbackMessage::decode(&original).is_some());
     }
 
     #[test]
@@ -806,16 +739,9 @@ mod tests {
         );
 
         receiver.on_control_sent(&first);
-        let resent = poll_sent(
-            &mut receiver,
-            MonoNs::new(1_000_000).saturating_add(FEEDBACK_RESEND_INTERVAL),
-        )
-        .unwrap();
+        assert_eq!(receiver.next_wakeup(), None);
+        assert_eq!(poll_sent(&mut receiver, MonoNs::new(50_000_000)), None);
         assert_eq!(FeedbackMessage::decode(&first).unwrap().control_id, Some(1));
-        assert_eq!(
-            FeedbackMessage::decode(&resent).unwrap().control_id,
-            Some(2)
-        );
     }
 
     #[test]

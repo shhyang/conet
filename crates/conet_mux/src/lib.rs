@@ -203,7 +203,8 @@ impl SchedulerPort for RoundRobinScheduler {
 
 /// Declarative shares for the hop-level [`TreeScheduler`].
 ///
-/// This is a service-share tree over attached mux users.
+/// This is a service-share tree over attached mux users (weights for fair
+/// scheduling among users on one lower hop).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchedulerNode {
     User {

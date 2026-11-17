@@ -97,7 +97,6 @@ fn udp_endpoint_stops_bulk_before_the_reported_window_cap() {
             inflight: 0,
         }),
     );
-    endpoint.establish_for_test(10, 1).unwrap();
     for value in 0..3 {
         endpoint
             .enqueue_file_data(payload_packet([value; 100]))
@@ -130,7 +129,6 @@ fn rate_only_controller_without_an_inflight_sample_is_unaffected() {
         Role::Initiator,
         Box::new(RateOnlyController { rate: u64::MAX }),
     );
-    endpoint.establish_for_test(11, 1).unwrap();
     for value in 0..4 {
         endpoint
             .enqueue_file_data(payload_packet([value; 100]))
@@ -159,7 +157,6 @@ fn trailer_tipped_data_stays_queued_without_blocking_control_egress() {
             trailer: OpaqueBytes::copy_from_slice(&[0xcc; 24]),
         }),
     );
-    endpoint.establish_for_test(12, 1).unwrap();
     endpoint
         .enqueue_file_data(payload_packet([0x44; 32]))
         .unwrap();

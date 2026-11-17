@@ -16,22 +16,23 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "conet_cc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
+ "conet_transfer",
  "conet_udp",
 ]
 
 [[package]]
 name = "conet_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "conet_fountain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
  "fountain_engine",
@@ -41,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "conet_mux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
  "conet_udp",
@@ -49,14 +50,14 @@ dependencies = [
 
 [[package]]
 name = "conet_sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
 ]
 
 [[package]]
 name = "conet_transfer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
  "conet_fountain",
@@ -65,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "conet_udp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "conet_core",
  "libc",
